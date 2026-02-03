@@ -115,6 +115,7 @@ gh variable set CLEA_OUT_GDRIVE_FOLDER_ID --env "$ENV_NAME" --repo "$REPO_FULL" 
 # Secret names
 gh variable set LOGIN_INFO_SECRET_NAME --env "$ENV_NAME" --repo "$REPO_FULL" --body "$LOGIN_INFO_SECRET_NAME"
 
+
 echo ""
 echo "[DONE] ✅ Repo secret + stg env vars configured."
 echo "       Secret:    GHA_GCP_AIRUX8_DEPLOYER_SA, MENTERU_TOOLS_DEPLOY_KEY (repo-level)"
