@@ -24,7 +24,50 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def compose_idu(df: pd.DataFrame) -> Optional[pd.DataFrame]:
+def get_mapping(
+    master_df: pd.DataFrame,
+    sheet_name: str,
+    key_column: str,
+    value_column: str,
+) -> dict[str, int]:
+    """
+    Load a two-column sheet as a key -> value mapping.
+
+    Args:
+        sheet_name: Name of the sheet (e.g. "設備マスタ").
+
+    Returns:
+        Dict mapping key column (as str) to value column (as str). Empty dict on error.
+    """
+    try:
+        if sheet_name not in master_df:
+            raise KeyError(f"'{sheet_name}' sheet not found")
+
+        df = master_df[sheet_name]
+        logger.info(f"Loaded {sheet_name} sheet: shape={df.shape}")
+
+        mapping = (
+            df.assign(
+                k=df[key_column].astype(str),
+                v=pd.to_numeric(df[value_column], errors="coerce"),
+            )
+            .dropna(subset=["v"])
+            .dropna(subset=["k"])
+            .groupby("k", sort=False)["v"]
+            .first()
+            .to_dict()
+        )
+
+        return mapping
+
+    except Exception:
+        logger.exception(f"Error extracting mapping from {sheet_name}")
+        return {}
+
+
+def compose_idu(
+    df: pd.DataFrame, facility_id: str, gc_storage_client: storage.Storage
+) -> Optional[pd.DataFrame]:
     """
     Processes and standardizes AC Indoor Unit (IDU) data.
 
@@ -75,18 +118,27 @@ def compose_idu(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     # Mapping
     out_df[["ac_on_off", "ac_mode", "ac_fan_speed"]] = out_df[
         ["ac_on_off", "ac_mode", "ac_fan_speed"]
-    ].apply(lambda s: s.str.upper())
+    ]
 
-    out_df["ac_on_off"] = out_df["ac_on_off"].map({"OFF": 0, "ON": 1}).astype("Int64")
-    out_df["ac_mode"] = (
-        out_df["ac_mode"]
-        .map({"OFF": 0, "COOL": 1, "HEAT": 2, "FAN": 3})
-        .astype("Int64")
+    if DATA_SOURCE_TYPE == DataSourceType.LOCAL:
+        master_path = os.path.join(LOCAL_MASTER_DATA_PATH, f"MASTER_{facility_id}.xlsx")
+        master_df = pd.read_excel(master_path, sheet_name=None)
+    elif DATA_SOURCE_TYPE == DataSourceType.REMOTE:
+        master_path = os.path.join(
+            GCPEnv.MASTER_DATA_PATH, f"MASTER_{facility_id}.xlsx"
+        )
+        master_df = gc_storage_client.read_excel(master_path, sheet_name=None)
+
+    on_off_mapping = get_mapping(master_df, "mode_mappings", "on_off_value", "on_off")
+    mode_mapping = get_mapping(master_df, "mode_mappings", "mode_value", "mode")
+    fan_speed_mapping = get_mapping(
+        master_df, "mode_mappings", "fan_speed_value", "fan_speed"
     )
+
+    out_df["ac_on_off"] = out_df["ac_on_off"].map(on_off_mapping).astype("Int64")
+    out_df["ac_mode"] = out_df["ac_mode"].map(mode_mapping).astype("Int64")
     out_df["ac_fan_speed"] = (
-        out_df["ac_fan_speed"]
-        .map({"AUTO": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3, "TOP": 4})
-        .astype("Int64")
+        out_df["ac_fan_speed"].map(fan_speed_mapping).astype("Int64")
     )
 
     logger.info("IDU composition (cleaning/transforming) complete.")
@@ -243,7 +295,7 @@ def main():
                     raise Exception(f"Error while loading raw data from BigQuery: {e}")
 
                 # 2. Transform Data
-                idu = compose_idu(idu_raw)
+                idu = compose_idu(idu_raw, facility_id, gc_storage_client)
                 odu = compose_odu(odu_raw)
 
                 # 3. Save IDU Data
