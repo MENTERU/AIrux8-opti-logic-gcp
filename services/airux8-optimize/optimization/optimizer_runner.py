@@ -230,6 +230,7 @@ class OptimizerRunner:
             self.optimizer = Optimizer(
                 store_name=self.store_name,
                 use_operating_hours=False,
+                use_model_path=True,
             )
             result_df = self.optimizer.optimize_all_zones(
                 forecast_df=self.weather_data,
