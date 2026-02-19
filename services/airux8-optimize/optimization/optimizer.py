@@ -1755,7 +1755,6 @@ class Optimizer:
         if data_ok and self.store_name:
             self._ensure_models_loaded(self.store_name)
         use_model_path = data_ok and self._model_available()
-        # use_model_path = data_ok and False
     
         if use_model_path:
             print(
