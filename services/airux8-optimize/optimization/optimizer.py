@@ -25,18 +25,20 @@ class Optimizer:
     """
     Zone-based HVAC optimization class.
 
-    This class implements the optimization algorithm to find optimal AC settings
-    per zone by matching similar historical weather patterns and selecting the
-    best-performing settings that minimize power consumption while maintaining comfort.
+    Two paths:
+    - Model path (when data size OK and model available): wider candidates, score by model
+      (predict power/temp/humidity under today's forecast), filter by comfort, select min predicted power.
+    - Fallback path (when data size insufficient or model not available): similar days
+      (temp + solar + humidity), rank by historical adjusted_power, filter by comfort
+      (historical indoor temp), select best (lowest power within comfort).
 
-    Supports two optimization modes:
-    - Whole day mode (hour_block_size=None): Selects complete 24-hour historical days
-    - Hour block mode (hour_block_size is integer >= 2): Selects best N-hour blocks
-      from candidate historical days, where each block can come from different days
-
-    Both modes filter for AC ON status only and support optional forecast hour range filtering.
+    Supports whole-day or hour-block mode for the fallback path.
     """
-    # making sure the zone order for the wide format is correct
+    # Minimum historical data to use model path (otherwise fallback)
+    MIN_HISTORICAL_ROWS = 500
+    MIN_HISTORICAL_DAYS = 14
+
+    # Zone order for wide format
     ZONE_ORDER = [
         "Area 1",
         "Area2_1",
@@ -54,6 +56,7 @@ class Optimizer:
         forecast_hour_range: Optional[Tuple[int, int]] = None,
         store_name: Optional[str] = None,
         use_mode_priority: bool = False,
+        use_model_path: bool = False,
     ):
         """
         Initialize the Optimizer with configuration.
@@ -67,6 +70,8 @@ class Optimizer:
             store_name: Store name (e.g., "Clea") for loading operation type mapping from master data
             use_mode_priority: If True, prioritize target operation mode (COOL/HEAT) over FAN when selecting patterns.
                 If False (default), simply select the pattern with lowest power consumption.
+            use_model_path: If True, use model-based path when data and model are available.
+                If False (default), always use fallback (similar-day + historical power).
         """
         # AC Mode mapping: operation type string to numeric value
         self.OPERATION_TYPE_TO_MODE = {"COOL": 1, "HEAT": 2, "FAN": 3, "OFF": 0}
@@ -108,12 +113,69 @@ class Optimizer:
 
         # Whether to use mode priority when selecting patterns (eg. COOL/HEAT > FAN)
         self.use_mode_priority = use_mode_priority
+        # When True, use model path when available; when False, always use fallback
+        self.use_model_path = use_model_path
 
         self.category_mappings = self._load_category_mappings()
         # Load operation type mapping if store_name is provided
         self.operation_type_mapping = (
             self._load_operation_type_mapping(store_name) if store_name else {}
         )
+        # When True, fallback path filters candidates by comfort range (historical indoor temp)
+        self.use_comfort_filter = True
+        # Lazy-loaded per-zone models for model path (store -> zone -> artifact)
+        self._zone_models: Dict[str, dict] = {}
+        self._models_store: Optional[str] = None
+
+    def _ensure_models_loaded(self, store_name: Optional[str]) -> None:
+        """Load per-zone models from 03_Models for the given store (once per store)."""
+        if not store_name:
+            return
+        if self._models_store == store_name and self._zone_models:
+            return
+        try:
+            from optimization.zone_model_trainer import load_all_zone_models_for_store
+
+            self._zone_models = load_all_zone_models_for_store(store_name)
+            self._models_store = store_name
+            if self._zone_models:
+                logging.info(
+                    f"Loaded {len(self._zone_models)} zone model(s) for store {store_name}"
+                )
+        except Exception as e:
+            logging.warning(f"Could not load zone models for {store_name}: {e}")
+            self._zone_models = {}
+            self._models_store = store_name
+
+    def _model_available(self) -> bool:
+        """Return True if model path is enabled and at least one zone model is loaded."""
+        return self.use_model_path and len(self._zone_models) > 0
+
+    def _filter_patterns_by_comfort(
+        self,
+        patterns_df: pd.DataFrame,
+        zone: str,
+        forecast_month: int,
+        master_data: dict,
+    ) -> pd.DataFrame:
+        """
+        Keep only patterns whose historical Indoor Temp. is within comfort range for zone and month.
+        Returns a copy; if 'Indoor Temp.' is missing or comfort range cannot be loaded, returns full copy.
+        """
+        if patterns_df.empty:
+            return patterns_df.copy()
+        if "Indoor Temp." not in patterns_df.columns:
+            return patterns_df.copy()
+        try:
+            comfort_min, comfort_max = get_comfort_range(master_data, zone, forecast_month)
+        except Exception:
+            return patterns_df.copy()
+        in_comfort = (
+            patterns_df["Indoor Temp."].notna()
+            & (patterns_df["Indoor Temp."] >= comfort_min)
+            & (patterns_df["Indoor Temp."] <= comfort_max)
+        )
+        return patterns_df.loc[in_comfort].copy()
 
     def _load_category_mappings(self) -> Dict:
         """Load category mappings from config file."""
@@ -364,21 +426,22 @@ class Optimizer:
         """
         Get weather weights based on hour of the day.
 
-        For hours 17:00 to 6:00 (next day): temperature 1.0, solar_radiation 0.0
-        For other hours (7:00 to 16:59): temperature 0.7, solar_radiation 0.3
+        For hours 17:00 to 6:00 (next day): temperature 0.8, solar 0.0, humidity 0.2
+        For other hours (7:00 to 16:59): temperature 0.5, solar 0.3, humidity 0.2
+        Humidity is used when available in data (perceived/actual load).
 
         Args:
             hour: Hour of the day (0-23)
 
         Returns:
-            Dictionary with temperature and solar_radiation weights
+            Dictionary with temperature, solar_radiation, and humidity weights
         """
-        # Hours 17:00 (17) to 6:00 (6) next day: use temperature only
+        # Hours 17:00 (17) to 6:00 (6) next day: temperature dominant, no solar
         if hour >= 17 or hour < 7:
-            return {"temperature": 1.0, "solar_radiation": 0.0}
-        # Hours 7:00 to 16:59: use both temperature and solar radiation
+            return {"temperature": 0.8, "solar_radiation": 0.0, "humidity": 0.2}
+        # Hours 7:00 to 16:59: temperature, solar, and humidity
         else:
-            return {"temperature": 0.7, "solar_radiation": 0.3}
+            return {"temperature": 0.5, "solar_radiation": 0.3, "humidity": 0.2}
 
     def _map_ac_mode(self, mode_value: int) -> str:
         """Map AC mode numeric value to string."""
@@ -481,59 +544,95 @@ class Optimizer:
         if len(zone_data) == 0 or "Date" not in zone_data.columns:
             return []
 
+        # Weather columns for similarity: temp and solar always; humidity when present
+        weather_cols = ["Outdoor Temp.", "Solar Radiation"]
+        use_humidity = (
+            "Outdoor Humidity" in forecast_day_data.columns
+            and "Outdoor Humidity" in zone_data.columns
+        )
+        if use_humidity:
+            weather_cols = ["Outdoor Temp.", "Solar Radiation", "Outdoor Humidity"]
+
         # Calculate forecast day's mean weather
-        f_temp_mean = forecast_day_data["Outdoor Temp."].mean()
-        f_solar_mean = forecast_day_data["Solar Radiation"].mean()
+        f_means = {c: forecast_day_data[c].mean() for c in weather_cols}
 
         # Historical daily means for the zone
         daily_hist = (
-            zone_data.groupby("Date")[["Outdoor Temp.", "Solar Radiation"]]
-            .mean()
-            .reset_index()
+            zone_data.groupby("Date")[weather_cols].mean().reset_index()
         )
 
         if daily_hist.empty:
             return []
 
-        # Use z-score normalization for better day-level comparison
-        daily_hist_temp = daily_hist["Outdoor Temp."].dropna()
-        daily_hist_solar = daily_hist["Solar Radiation"].dropna()
+        # Add day-of-week and weekend/holiday for similar-day (weather + day type per policy)
+        forecast_dt = pd.to_datetime(forecast_day_data["datetime"].iloc[0])
+        f_dow = forecast_dt.dayofweek  # 0=Mon, 6=Sun
+        f_weekend = 1 if f_dow in (5, 6) else 0
+        f_holiday = 0  # optional: set from calendar if available
+        if "DayOfWeek" in zone_data.columns and "IsWeekend" in zone_data.columns:
+            day_meta = (
+                zone_data.groupby("Date")[["DayOfWeek", "IsWeekend"]]
+                .first()
+                .reset_index()
+            )
+            daily_hist = daily_hist.merge(day_meta, on="Date", how="left")
+            # Weekend mismatch penalty (0 or 1)
+            daily_hist["_weekend_diff"] = (
+                daily_hist["IsWeekend"].fillna(0).astype(int) != f_weekend
+            ).astype(int)
+            # Day-of-week circular distance (0–3)
+            h_dow = daily_hist["DayOfWeek"].fillna(0).astype(int)
+            dow_diff = np.abs(h_dow - f_dow)
+            daily_hist["_dow_diff"] = np.minimum(dow_diff, 7 - dow_diff)
+            if "IsHoliday" in zone_data.columns:
+                hol_meta = zone_data.groupby("Date")["IsHoliday"].first().reset_index()
+                daily_hist = daily_hist.merge(hol_meta, on="Date", how="left")
+                daily_hist["_holiday_diff"] = (
+                    daily_hist["IsHoliday"].fillna(0).astype(int) != f_holiday
+                ).astype(int)
+            else:
+                daily_hist["_holiday_diff"] = 0
+        else:
+            daily_hist["_weekend_diff"] = 0
+            daily_hist["_dow_diff"] = 0
+            daily_hist["_holiday_diff"] = 0
 
-        hist_temp_mean, hist_temp_std = daily_hist_temp.mean(), daily_hist_temp.std()
-        hist_solar_mean, hist_solar_std = (
-            daily_hist_solar.mean(),
-            daily_hist_solar.std(),
-        )
-
-        # Calculate z-scores for forecast day
-        forecast_temp_z = (
-            (f_temp_mean - hist_temp_mean) / hist_temp_std if hist_temp_std > 0 else 0
-        )
-        forecast_solar_z = (
-            (f_solar_mean - hist_solar_mean) / hist_solar_std
-            if hist_solar_std > 0
-            else 0
-        )
-
-        # Calculate z-scores for historical days
-        daily_hist["temp_z"] = (
-            (daily_hist["Outdoor Temp."] - hist_temp_mean) / hist_temp_std
-            if hist_temp_std > 0
-            else 0
-        )
-        daily_hist["solar_z"] = (
-            (daily_hist["Solar Radiation"] - hist_solar_mean) / hist_solar_std
-            if hist_solar_std > 0
-            else 0
-        )
+        # Z-score normalization per feature
+        daily_hist = daily_hist.copy()
+        forecast_zs = {}
+        for c in weather_cols:
+            hist_vals = daily_hist[c].dropna()
+            h_mean, h_std = hist_vals.mean(), hist_vals.std()
+            forecast_zs[c] = (
+                (f_means[c] - h_mean) / h_std if h_std > 0 else 0
+            )
+            daily_hist[f"{c}_z"] = (
+                (daily_hist[c] - h_mean) / h_std if h_std > 0 else 0
+            )
 
         # Get weather weights based on first hour of forecast day
-        forecast_first_hour = pd.to_datetime(forecast_day_data["datetime"].iloc[0]).hour
+        forecast_first_hour = forecast_dt.hour
         weather_weights = self._get_weather_weights(forecast_first_hour)
-        # Calculate day-level distance score (lower is better)
-        daily_hist["score"] = abs(daily_hist["temp_z"] - forecast_temp_z) + abs(
-            daily_hist["solar_z"] - forecast_solar_z
+
+        # Weighted day-level distance score (lower is better): weather + day type
+        score = (
+            weather_weights["temperature"]
+            * abs(daily_hist["Outdoor Temp._z"] - forecast_zs["Outdoor Temp."])
+            + weather_weights["solar_radiation"]
+            * abs(daily_hist["Solar Radiation_z"] - forecast_zs["Solar Radiation"])
         )
+        if use_humidity:
+            score = score + weather_weights["humidity"] * abs(
+                daily_hist["Outdoor Humidity_z"] - forecast_zs["Outdoor Humidity"]
+            )
+        # Day type terms (weekend > dow > holiday) so similar days prefer same weekday/weekend
+        score = (
+            score
+            + 0.2 * daily_hist["_weekend_diff"]
+            + 0.05 * daily_hist["_dow_diff"]
+            + 0.05 * daily_hist["_holiday_diff"]
+        )
+        daily_hist["score"] = score
 
         # Select top N days based on day-level similarity
         top_days = daily_hist.nsmallest(n_top, "score")["Date"].tolist()
@@ -677,6 +776,38 @@ class Optimizer:
             best_day_patterns["hour"].isin(forecast_hours)
         ].copy()
 
+        # Filter by comfort range (historical indoor temp) when enabled
+        if self.use_comfort_filter and not best_day_patterns.empty and master_data:
+            forecast_month = pd.to_datetime(
+                forecast_day_data["datetime"].iloc[0]
+            ).month
+            in_comfort = self._filter_patterns_by_comfort(
+                best_day_patterns, zone, forecast_month, master_data
+            )
+            # For each hour: use in-comfort pattern if any, else fall back to best (lowest power) for that hour
+            if not in_comfort.empty:
+                best_day_patterns = best_day_patterns.sort_values(
+                    "adjusted_power"
+                )
+                hours_with_comfort = in_comfort["hour"].unique()
+                rows_list = []
+                for h in forecast_hours:
+                    in_comfort_h = in_comfort[in_comfort["hour"] == h]
+                    if len(in_comfort_h) > 0:
+                        rows_list.append(
+                            in_comfort_h.sort_values("adjusted_power").iloc[
+                                0
+                            ]
+                        )
+                    else:
+                        fallback_h = best_day_patterns[
+                            best_day_patterns["hour"] == h
+                        ]
+                        if len(fallback_h) > 0:
+                            rows_list.append(fallback_h.iloc[0])
+                if rows_list:
+                    best_day_patterns = pd.DataFrame(rows_list)
+
         # Filter patterns by AC Mode to match operation type if available (relaxed filtering)
         if forecast_operation_type and "A/C Mode" in best_day_patterns.columns:
             # Get allowed AC Mode values (relaxed: COOL allows FAN, HEAT allows FAN)
@@ -764,12 +895,10 @@ class Optimizer:
         historical_temp_mean = historical_block["Outdoor Temp."].mean()
         historical_solar_mean = historical_block["Solar Radiation"].mean()
 
-        # Calculate z-scores for normalization (using historical data statistics)
-        # Get historical data statistics for normalization
+        # Normalized differences (z-style using historical std)
         hist_temp_std = historical_block["Outdoor Temp."].std()
         hist_solar_std = historical_block["Solar Radiation"].std()
 
-        # Use simple difference if standard deviation is 0 (all values same)
         if hist_temp_std > 0:
             temp_diff = abs(forecast_temp_mean - historical_temp_mean) / hist_temp_std
         else:
@@ -782,14 +911,31 @@ class Optimizer:
         else:
             solar_diff = abs(forecast_solar_mean - historical_solar_mean)
 
-        # Get weather weights based on first hour of forecast block
+        # Get weather weights
         forecast_first_hour = pd.to_datetime(forecast_block["datetime"].iloc[0]).hour
         weather_weights = self._get_weather_weights(forecast_first_hour)
-        # Calculate weighted weather distance (lower is better)
+
         weather_distance = (
             weather_weights["temperature"] * temp_diff
             + weather_weights["solar_radiation"] * solar_diff
         )
+
+        # Add humidity when present in both blocks
+        if (
+            "Outdoor Humidity" in forecast_block.columns
+            and "Outdoor Humidity" in historical_block.columns
+        ):
+            f_hum_mean = forecast_block["Outdoor Humidity"].mean()
+            h_hum_mean = historical_block["Outdoor Humidity"].mean()
+            h_hum_std = historical_block["Outdoor Humidity"].std()
+            hum_diff = (
+                abs(f_hum_mean - h_hum_mean) / h_hum_std
+                if h_hum_std > 0
+                else abs(f_hum_mean - h_hum_mean)
+            )
+            weather_distance = (
+                weather_distance + weather_weights["humidity"] * hum_diff
+            )
 
         return weather_distance
 
@@ -1006,6 +1152,13 @@ class Optimizer:
                     f"  → Direct hour matching: forecast hours {sorted(hour_block)} → historical hours {sorted(best_candidate['hours'])} (exact match)"
                 )
 
+                # Forecast month for comfort range
+                forecast_month = (
+                    pd.to_datetime(forecast_block["datetime"].iloc[0]).month
+                    if "datetime" in forecast_block.columns
+                    else 1
+                )
+
                 # Map each forecast hour to its corresponding historical hour (same hour value)
                 for forecast_hour in hour_block:
                     # Get the row(s) for this historical hour (same hour as forecast)
@@ -1014,8 +1167,19 @@ class Optimizer:
                     ]
 
                     if len(hist_rows) == 0:
-                        # Should not happen since we verified all hours exist, but defensive check
                         continue
+
+                    # Filter by comfort range (historical indoor temp) when enabled
+                    if (
+                        self.use_comfort_filter
+                        and master_data
+                        and "Indoor Temp." in hist_rows.columns
+                    ):
+                        in_comfort_rows = self._filter_patterns_by_comfort(
+                            hist_rows, zone, forecast_month, master_data
+                        )
+                        if len(in_comfort_rows) > 0:
+                            hist_rows = in_comfort_rows
 
                     # Filter by AC Mode to match operation type if available (relaxed filtering)
                     if forecast_operation_type and "A/C Mode" in hist_rows.columns:
@@ -1074,6 +1238,256 @@ class Optimizer:
         )
 
         return patterns_by_hour
+
+    def _optimize_zone_with_model(
+        self,
+        historical_df: pd.DataFrame,
+        forecast_df: pd.DataFrame,
+        zone: str,
+        master_data: dict,
+    ) -> Optional[pd.DataFrame]:
+        """
+        Model path: wider candidates (unique historical setting patterns),
+        score each by model (predict power and temp under forecast), filter by comfort,
+        select pattern with minimum predicted power. Returns None when model not available.
+        """
+        artifact = self._zone_models.get(zone) if self._zone_models else None
+        if artifact is None:
+            return None
+
+        power_pipe = artifact.get("power_model")
+        temp_pipe = artifact.get("temp_model")
+        feature_names = artifact.get("feature_names", [])
+        impute_means = artifact.get("impute_means", {})
+        if not power_pipe or not feature_names:
+            return None
+
+        # Operating hours and forecast range (mirror fallback)
+        if self.use_operating_hours:
+            start_hour, end_hour = get_zone_operating_hours(master_data, zone)
+        else:
+            start_hour, end_hour = 0, 24
+
+        forecast_df_original = forecast_df.copy()
+        forecast_df_working = forecast_df.copy()
+        if self.forecast_hour_range is not None:
+            range_start, range_end = self.forecast_hour_range
+            forecast_df_working["_hour"] = pd.to_datetime(
+                forecast_df_working["datetime"]
+            ).dt.hour
+            forecast_df_working = forecast_df_working[
+                (forecast_df_working["_hour"] >= range_start)
+                & (forecast_df_working["_hour"] < range_end)
+            ].copy()
+            forecast_df_working = forecast_df_working.drop(columns=["_hour"])
+
+        # Wider candidates: unique (Set Temp, Mode, Fan Speed, ON/OFF) from history for this zone
+        zone_hist = historical_df[historical_df["zone"] == zone].copy()
+        if zone_hist.empty:
+            return None
+
+        # Optional: filter by operation type for forecast month (use first forecast day's month)
+        forecast_month = (
+            pd.to_datetime(forecast_df_working["datetime"].iloc[0]).month
+            if len(forecast_df_working) > 0
+            else None
+        )
+        if forecast_month is not None and self.operation_type_mapping:
+            key = (zone, forecast_month)
+            op_type = self.operation_type_mapping.get(key)
+            if op_type:
+                allowed = self._get_allowed_ac_modes(op_type)
+                if allowed:
+                    zone_hist = zone_hist[
+                        zone_hist["A/C Mode"].fillna(-1).astype(int).isin(allowed)
+                    ]
+        if zone_hist.empty:
+            return None
+
+        # One row per unique setting combination; ensure A/C Status
+        if "A/C Status" not in zone_hist.columns:
+            zone_hist["A/C Status"] = np.where(
+                (zone_hist["A/C ON/OFF"].fillna(0) == 0) | (zone_hist["A/C ON/OFF"].isna()),
+                0,
+                zone_hist["A/C Mode"].fillna(0),
+            )
+        key_cols = [
+            "A/C Set Temperature",
+            "A/C Mode",
+            "A/C Fan Speed",
+            "A/C ON/OFF",
+            "A/C Status",
+        ]
+        key_cols = [c for c in key_cols if c in zone_hist.columns]
+        candidates_df = (
+            zone_hist.drop_duplicates(subset=key_cols, keep="first")
+            .reset_index(drop=True)
+        )
+        if candidates_df.empty:
+            return None
+
+        # Sort forecast by datetime for sequential Indoor Temp. Lag1
+        forecast_sorted = forecast_df_working.sort_values("datetime").reset_index(drop=True)
+        results = []
+        last_predicted_temp = impute_means.get("Indoor Temp. Lag1", 25.0)
+        if pd.isna(last_predicted_temp):
+            last_predicted_temp = 25.0
+
+        zone_info = master_data.get("zones", {}).get(zone, {})
+        max_units = sum(
+            len(ou.get("indoor_units", []))
+            for ou in zone_info.get("outdoor_units", {}).values()
+        )
+        if max_units <= 0:
+            max_units = 1
+
+        for _, forecast_row in forecast_sorted.iterrows():
+            forecast_datetime = pd.to_datetime(forecast_row["datetime"])
+            hour = forecast_datetime.hour
+            if self.use_operating_hours and not (start_hour <= hour < end_hour):
+                continue
+
+            month = forecast_datetime.month
+            day_of_week = forecast_datetime.dayofweek
+            is_weekend = 1 if day_of_week >= 5 else 0
+            is_holiday = 0  # Could be from master/calendar if needed
+
+            # Build feature matrix: one row per candidate
+            rows = []
+            for _, pat in candidates_df.iterrows():
+                set_temp = pat.get("A/C Set Temperature")
+                ac_status = pat.get("A/C Status")
+                if pd.isna(ac_status):
+                    ac_status = 0 if (pat.get("A/C ON/OFF", 0) == 0) else pat.get("A/C Mode", 0)
+                fan_speed = pat.get("A/C Fan Speed", 0)
+                if pd.isna(fan_speed):
+                    fan_speed = 0
+                out_temp = forecast_row.get("Outdoor Temp.")
+                out_hum = forecast_row.get("Outdoor Humidity")
+                solar = forecast_row.get("Solar Radiation")
+                if pd.isna(out_temp):
+                    out_temp = impute_means.get("Outdoor Temp.", 25.0)
+                if pd.isna(out_hum):
+                    out_hum = impute_means.get("Outdoor Humidity", 50.0)
+                if pd.isna(solar):
+                    solar = impute_means.get("Solar Radiation", 0.0)
+                if pd.isna(set_temp):
+                    set_temp = impute_means.get("A/C Set Temperature", 26.0)
+
+                row = {
+                    "A/C Set Temperature": float(set_temp),
+                    "Indoor Temp. Lag1": float(last_predicted_temp),
+                    "A/C Status": int(ac_status),
+                    "A/C Fan Speed": int(fan_speed),
+                    "Outdoor Temp.": float(out_temp),
+                    "Outdoor Humidity": float(out_hum),
+                    "Solar Radiation": float(solar),
+                    "DayOfWeek": day_of_week,
+                    "Hour": hour,
+                    "Month": month,
+                    "IsWeekend": is_weekend,
+                    "IsHoliday": is_holiday,
+                }
+                rows.append(row)
+
+            X = pd.DataFrame(rows)
+            # Align columns to model's feature_names order; fill missing with impute
+            for c in feature_names:
+                if c not in X.columns:
+                    X[c] = impute_means.get(c, 0)
+            X = X[feature_names].astype(float)
+
+            pred_power = power_pipe.predict(X)
+            pred_temp = temp_pipe.predict(X) if temp_pipe else np.full(len(X), last_predicted_temp)
+
+            # Comfort filter
+            try:
+                comfort_min, comfort_max = get_comfort_range(master_data, zone, month)
+            except Exception:
+                comfort_min, comfort_max = 22.0, 28.0
+            in_comfort = (pred_temp >= comfort_min) & (pred_temp <= comfort_max)
+            if not in_comfort.any():
+                in_comfort = np.ones(len(pred_temp), dtype=bool)
+
+            valid_power = np.where(in_comfort, pred_power, np.inf)
+            best_idx = int(np.argmin(valid_power))
+            best = candidates_df.iloc[best_idx]
+            last_predicted_temp = float(pred_temp[best_idx])
+
+            units_count = min(
+                int(best.get("A/C ON/OFF", 0) or 0),
+                max_units,
+            )
+            ac_mode_value = best.get("A/C Mode")
+            if pd.isna(ac_mode_value):
+                ac_mode_value = 0
+            else:
+                ac_mode_value = int(ac_mode_value)
+            fan_speed_value = best.get("A/C Fan Speed")
+            if pd.isna(fan_speed_value):
+                fan_speed_value = 0
+            else:
+                fan_speed_value = int(fan_speed_value)
+
+            # When AC is OFF, power must be 0 (model may predict non-zero)
+            power_value = int(round(float(pred_power[best_idx])))if units_count > 0 else 0.0
+
+            results.append({
+                "datetime": forecast_datetime,
+                "zone": zone,
+                "set_temp": best["A/C Set Temperature"],
+                "mode": self._map_ac_mode(ac_mode_value),
+                "fan_speed": self._map_fan_speed(fan_speed_value),
+                "numb_units_on": units_count,
+                "ac_on_off": self._map_ac_on_off(units_count),
+                "power": power_value,
+                "indoor_temp": f"{float(last_predicted_temp):.1f}",
+                "hist_datetime_used": None,
+                "forecast_outdoor_temp": forecast_row.get("Outdoor Temp."),
+                "forecast_solar_radiation": forecast_row.get("Solar Radiation"),
+                "hist_outdoor_temp": forecast_row.get("Outdoor Temp."),
+                "hist_solar_radiation": forecast_row.get("Solar Radiation"),
+                "hist_indoor_temp": f"{float(last_predicted_temp):.1f}",
+            })
+
+        if not results:
+            return None
+
+        result_df = pd.DataFrame(results).sort_values("datetime").reset_index(drop=True)
+
+        # Hours outside forecast_hour_range: add empty rows like fallback
+        if self.forecast_hour_range is not None:
+            range_start, range_end = self.forecast_hour_range
+            forecast_df_original["_hour"] = pd.to_datetime(
+                forecast_df_original["datetime"]
+            ).dt.hour
+            outside = forecast_df_original[
+                (forecast_df_original["_hour"] < range_start)
+                | (forecast_df_original["_hour"] >= range_end)
+            ].copy()
+            for _, row in outside.iterrows():
+                dt = pd.to_datetime(row["datetime"])
+                results.append({
+                    "datetime": dt,
+                    "zone": zone,
+                    "set_temp": None,
+                    "mode": None,
+                    "fan_speed": None,
+                    "numb_units_on": None,
+                    "ac_on_off": None,
+                    "power": None,
+                    "indoor_temp": None,
+                    "hist_datetime_used": None,
+                    "forecast_outdoor_temp": row.get("Outdoor Temp."),
+                    "forecast_solar_radiation": row.get("Solar Radiation"),
+                    "hist_outdoor_temp": None,
+                    "hist_solar_radiation": None,
+                    "hist_indoor_temp": None,
+                })
+            result_df = pd.DataFrame(results).sort_values("datetime").reset_index(drop=True)
+
+        print(f"\n[Zone: {zone}] Model path: {len(result_df)} hours scheduled")
+        return result_df
 
     def _optimize_zone_for_forecast(
         self,
@@ -1317,7 +1731,7 @@ class Optimizer:
         """
         # Load historical patterns
         historical_df = self.load_historical_patterns(features_csv_path)
-        
+
         # 12 month filter
         forecast_df["datetime"] = pd.to_datetime(forecast_df["datetime"])
         historical_df["Datetime"] = pd.to_datetime(historical_df["Datetime"])
@@ -1326,11 +1740,33 @@ class Optimizer:
         historical_df = historical_df[
             ~(
                 (historical_df["zone"].astype(str).str.strip().str.lower() == "area 1")
-                &
-                (historical_df["Datetime"] < twelve_months_ago)
+                & (historical_df["Datetime"] < twelve_months_ago)
             )
         ].copy()
-        
+
+        # Data size check: use model path only when enough data and model available
+        n_rows = len(historical_df)
+        n_days = historical_df["Date"].nunique() if "Date" in historical_df.columns else 0
+        data_ok = (
+            n_rows >= self.MIN_HISTORICAL_ROWS
+            and n_days >= self.MIN_HISTORICAL_DAYS
+        )
+
+        if data_ok and self.store_name:
+            self._ensure_models_loaded(self.store_name)
+        use_model_path = data_ok and self._model_available()
+        # use_model_path = data_ok and False
+    
+        if use_model_path:
+            print(
+                f"[Optimizer] Data size OK (rows={n_rows}, days={n_days}); using model path."
+            )
+        else:
+            print(
+                f"[Optimizer] Fallback path: data_ok={data_ok} (rows={n_rows}, days={n_days}), "
+                f"model_available={self._model_available()}. "
+                f"Similar-day + historical power + comfort filter."
+            )
         # Get list of all zones from historical data
         zones = sorted(historical_df["zone"].unique())
         zones = [z for z in self.ZONE_ORDER if z in historical_df["zone"].unique()]
@@ -1338,9 +1774,15 @@ class Optimizer:
 
         # Optimize each zone
         for zone in zones:
-            zone_results = self._optimize_zone_for_forecast(
-                historical_df, forecast_df, zone, master_data
-            )
+            zone_results = None
+            if use_model_path:
+                zone_results = self._optimize_zone_with_model(
+                    historical_df, forecast_df, zone, master_data
+                )
+            if zone_results is None or len(zone_results) == 0:
+                zone_results = self._optimize_zone_for_forecast(
+                    historical_df, forecast_df, zone, master_data
+                )
             if len(zone_results) > 0:
                 all_results.append(zone_results)
 
