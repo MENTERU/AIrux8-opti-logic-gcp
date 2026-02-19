@@ -2,8 +2,8 @@
 Compare optimization outputs: legacy vs updated (model-based) logic.
 
 Loads two zone-schedule CSVs (wide format), aligns by datetime and zone,
-and reports differences in set_temp, mode, fan_speed, numb_units_on,
-ac_on_off, power, and indoor_temp.
+and compares hourly AC setting contents per zone (set_temp, mode, fan_speed,
+numb_units_on, ac_on_off) and power consumption only.
 
 Usage (from services/airux8-optimize):
   uv run python scripts/compare_optimization_outputs.py \\
@@ -34,7 +34,7 @@ from pathlib import Path
 import pandas as pd
 
 
-# Per-zone columns to compare (suffixes; full column name is {zone}_{suffix})
+# Per-zone columns to compare: hourly AC settings + power only (full column name is {zone}_{suffix})
 COMPARE_SUFFIXES = [
     "set_temp",
     "mode",
@@ -42,11 +42,10 @@ COMPARE_SUFFIXES = [
     "numb_units_on",
     "ac_on_off",
     "power",
-    "indoor_temp",
 ]
 
 # Float columns: compare with tolerance
-FLOAT_SUFFIXES = {"set_temp", "power", "indoor_temp"}
+FLOAT_SUFFIXES = {"set_temp", "power"}
 FLOAT_TOLERANCE = 1e-3
 
 
