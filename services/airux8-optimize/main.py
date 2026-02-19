@@ -224,10 +224,11 @@ def run_optimization_for_store(
                 )
 
                 if results.get("status") == "success":
-                    # Save results
+                    # Save results (main CSV + zone_schedule_*_model.csv and zone_schedule_*_fallback.csv for comparison)
                     output_path = runner.save_results_to_csv(start_date, end_date)
                     print(f"✅ Optimization completed successfully!")
                     print(f"📁 Results saved to: {output_path}")
+                    print(f"📁 Comparison outputs: zone_schedule_<dates>_model.csv and zone_schedule_<dates>_fallback.csv (same folder)")
                     return True
                 else:
                     print(
