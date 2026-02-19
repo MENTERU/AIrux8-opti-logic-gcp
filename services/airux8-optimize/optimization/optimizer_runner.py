@@ -438,12 +438,14 @@ class OptimizerRunner:
             f"[OptimizerRunner] Zone-level optimization results saved to: {output_logical_path}"
         )
 
-        # Save model and fallback outputs for comparison
+        # Save model and fallback outputs for comparison (2 outputs for compare_optimization_outputs.py)
         if "optimization_result_model" in self.results and "optimization_result_fallback" in self.results:
+            model_path = f"04_PlanningData/{self.store_name}/zone_schedule_{date_suffix}_model.csv"
+            fallback_path = f"04_PlanningData/{self.store_name}/zone_schedule_{date_suffix}_fallback.csv"
             try:
                 storage.write_csv(
                     self.results["optimization_result_model"],
-                    f"04_PlanningData/{self.store_name}/zone_schedule_{date_suffix}_model.csv",
+                    model_path,
                 )
                 print(
                     f"[OptimizerRunner] Model output saved: zone_schedule_{date_suffix}_model.csv"
@@ -453,7 +455,7 @@ class OptimizerRunner:
             try:
                 storage.write_csv(
                     self.results["optimization_result_fallback"],
-                    f"04_PlanningData/{self.store_name}/zone_schedule_{date_suffix}_fallback.csv",
+                    fallback_path,
                 )
                 print(
                     f"[OptimizerRunner] Fallback output saved: zone_schedule_{date_suffix}_fallback.csv"
