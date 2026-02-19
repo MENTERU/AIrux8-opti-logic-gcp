@@ -238,23 +238,57 @@ def run_comparison(
 def _json_serializer(obj):
     """Convert numpy/pandas types and NaN for JSON."""
     if hasattr(obj, "item"):
-        return obj.item()
+        v = obj.item()
+        if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+            return None
+        return v
     if pd.isna(obj):
         return None
+    if isinstance(obj, (int, float, str, bool)) or obj is None:
+        if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
+            return None
+        return obj
     if hasattr(obj, "isoformat"):
         return obj.isoformat()
     raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
 
 
 def _json_default(o):
-    """Used as default= in json.dumps for numpy/NaN/datetime."""
+    """Used as default= in json.dumps for numpy/NaN/datetime. Never return float nan/inf."""
     if hasattr(o, "item"):
-        return o.item()
+        v = o.item()
+        if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+            return None
+        return v
     if isinstance(o, float) and (math.isnan(o) or math.isinf(o)):
         return None
     if hasattr(o, "isoformat"):
         return o.isoformat()
     raise TypeError(f"Object of type {type(o)} is not JSON serializable")
+
+
+def _make_json_safe(obj):
+    """Recursively convert payload so json.dumps never sees nan/inf or numpy types."""
+    if isinstance(obj, dict):
+        return {str(k): _make_json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_make_json_safe(v) for v in obj]
+    if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
+        return None
+    if hasattr(obj, "item"):
+        return _make_json_safe(obj.item())
+    if pd.isna(obj):
+        return None
+    if hasattr(obj, "isoformat"):
+        return obj.isoformat()
+    if isinstance(obj, (int, float, str, bool)) or obj is None:
+        return obj
+    # numpy integer types etc.
+    try:
+        return int(obj)
+    except (TypeError, ValueError):
+        pass
+    raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
 
 
 def _build_report_payload(
@@ -414,8 +448,8 @@ def _viewer_html(embedded_data_json: str) -> str:
       var el = document.getElementById('chartTotalPower');
       if (el && typeof Chart !== 'undefined') new Chart(el, { type: 'line', data: c.total_power, options: chartOptions });
     }
-    var gridMap = { power_by_zone: 'chartPowerByZoneGrid', units_by_zone: 'chartUnitsByZoneGrid', settemp_by_zone: 'chartSettempByZoneGrid' };
-    ['power_by_zone', 'units_by_zone', 'settemp_by_zone'].forEach(function(key) {
+    var gridMap = { power_by_zone: 'chartPowerByZoneGrid', units_by_zone: 'chartUnitsByZoneGrid' };
+    ['power_by_zone', 'units_by_zone'].forEach(function(key) {
       var chartData = c[key];
       var step = key === 'units_by_zone';
       var grid = document.getElementById(gridMap[key]);
@@ -435,16 +469,9 @@ def _viewer_html(embedded_data_json: str) -> str:
     html += '<div class="meta"><b>Legacy:</b> ' + escapeHtml(meta.legacy_path || '') + '<br><b>Updated:</b> ' + escapeHtml(meta.updated_path || '') + '<br><b>Generated:</b> ' + escapeHtml(meta.generated_at || '') + '</div>';
     html += '<h2>Summary</h2>';
     html += renderTable(['metric', 'value'], (d.summary || []).map(function(r) { return { metric: r.metric, value: r.value }; }));
-    if ((d.diff_by_zone || []).length) { html += '<h2>Differences by zone</h2>'; html += renderTable(['zone', 'differences'], d.diff_by_zone); }
-    if ((d.diff_by_field || []).length) { html += '<h2>Differences by field</h2>'; html += renderTable(['field', 'differences'], d.diff_by_field); }
     html += '<h2>Total power over time (all zones)</h2><div class="chart-container"><canvas id="chartTotalPower"></canvas></div>';
     html += '<h2>Power by zone over time</h2><div class="chart-grid" id="chartPowerByZoneGrid"></div>';
     html += '<h2>AC units on by zone over time</h2><div class="chart-grid" id="chartUnitsByZoneGrid"></div>';
-    html += '<h2>Set temperature by zone over time</h2><div class="chart-grid" id="chartSettempByZoneGrid"></div>';
-    html += '<h2>Difference details (sample)</h2>';
-    if (d.diff_table_note) html += '<p>' + escapeHtml(d.diff_table_note) + '</p>';
-    if ((d.diff_table || []).length) html += renderTable(['datetime', 'zone', 'field', 'legacy_value', 'updated_value'], d.diff_table);
-    else html += '<p>No differences.</p>';
     document.getElementById('report').innerHTML = html;
     document.getElementById('report').style.display = 'block';
     document.getElementById('loading').style.display = 'none';
@@ -495,13 +522,27 @@ def _write_html_report(
         max_diff_table_rows,
     )
 
-    payload_json = json.dumps(payload, default=_json_default)
+    payload_safe = _make_json_safe(payload)
+    try:
+        payload_json = json.dumps(payload_safe, default=_json_default)
+    except (TypeError, ValueError) as e:
+        # If serialization fails, recursively replace any remaining float nan/inf and retry
+        def _fix_floats(obj):
+            if isinstance(obj, dict):
+                return {k: _fix_floats(v) for k, v in obj.items()}
+            if isinstance(obj, (list, tuple)):
+                return [_fix_floats(v) for v in obj]
+            if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
+                return None
+            return obj
+        payload_safe = _fix_floats(payload_safe)
+        payload_json = json.dumps(payload_safe, default=_json_default)
     html_path = output_dir / "comparison_report.html"
     html_path.write_text(_viewer_html(payload_json), encoding="utf-8")
 
     json_path = output_dir / "comparison_data.json"
     with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, default=_json_default, indent=2)
+        json.dump(payload_safe, f, default=_json_default, indent=2)
 
     return html_path
 
