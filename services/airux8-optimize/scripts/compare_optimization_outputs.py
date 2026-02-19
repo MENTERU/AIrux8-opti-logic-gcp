@@ -317,9 +317,6 @@ def _build_report_payload(
             })
 
     summary = [
-        {"metric": "Rows (aligned)", "value": stats["total_rows"]},
-        {"metric": "Rows with any difference", "value": stats["rows_with_any_diff"]},
-        {"metric": "Total field-level differences", "value": stats["total_diffs"]},
         {"metric": "Total power (Legacy)", "value": f"{stats['total_power_legacy']:,.0f}"},
         {"metric": "Total power (Updated)", "value": f"{stats['total_power_updated']:,.0f}"},
         {"metric": "Power delta (Updated − Legacy)", "value": f"{stats['power_delta']:+,.0f}"},
