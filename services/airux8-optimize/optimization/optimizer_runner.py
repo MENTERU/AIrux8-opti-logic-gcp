@@ -224,21 +224,30 @@ class OptimizerRunner:
             # Load data (master data and weather forecast)
             self.load_weather_data(start_date, end_date)
 
-            # Run optimization
-            # Enable use_operating_hours to respect zone operating hours from master data
-            # This ensures hours outside operating hours (e.g., midnight for Area 3/4) are not optimized
-            self.optimizer = Optimizer(
+            # Run optimization twice: model-based and legacy fallback (for comparison)
+            optimizer_model = Optimizer(
                 store_name=self.store_name,
                 use_operating_hours=False,
                 use_model_path=True,
             )
-            result_df = self.optimizer.optimize_all_zones(
+            result_model = optimizer_model.optimize_all_zones(
                 forecast_df=self.weather_data,
                 features_csv_path=self.features_csv_path,
                 master_data=self.master_data,
             )
 
-            if result_df.empty:
+            optimizer_fallback = Optimizer(
+                store_name=self.store_name,
+                use_operating_hours=False,
+                use_model_path=False,
+            )
+            result_fallback = optimizer_fallback.optimize_all_zones(
+                forecast_df=self.weather_data,
+                features_csv_path=self.features_csv_path,
+                master_data=self.master_data,
+            )
+
+            if result_fallback.empty and result_model.empty:
                 print("[OptimizerRunner] Zone optimization returned no data")
                 return {
                     "start_date": start_date,
@@ -246,15 +255,18 @@ class OptimizerRunner:
                     "error": "No optimization data",
                 }
 
-            self.results["optimization_result"] = result_df
+            self.optimizer = optimizer_fallback
+            self.results["optimization_result"] = result_fallback
+            self.results["optimization_result_model"] = result_model
+            self.results["optimization_result_fallback"] = result_fallback
             self.results["status"] = "success"
             self.results["start_date"] = start_date
             self.results["end_date"] = end_date
 
-            # Also generate unit-level format
+            # Unit-level format from fallback (backward compatibility)
             try:
                 unit_result_df = self.optimizer.get_unit_format(
-                    result_df, self.master_data
+                    result_fallback, self.master_data
                 )
                 if not unit_result_df.empty:
                     self.results["optimization_result_units"] = unit_result_df
@@ -269,10 +281,9 @@ class OptimizerRunner:
                 print(
                     f"[OptimizerRunner] Warning: Failed to generate unit-level format: {e}"
                 )
-                # Don't fail the whole optimization if unit format generation fails
 
             print(
-                f"[OptimizerRunner] Zone optimization completed successfully: {len(result_df)} results"
+                f"[OptimizerRunner] Zone optimization completed: model={len(result_model)} rows, fallback={len(result_fallback)} rows"
             )
             return self.results
 
@@ -405,16 +416,14 @@ class OptimizerRunner:
         # Output path (storage-backed)
         storage = get_storage_client()
 
-        # Generate filename with start and end dates
-        if filename is None:
-            # Convert dates to YYYYMMDD format
-            start_date_formatted = start_date.replace("-", "")
-            end_date_formatted = end_date.replace("-", "")
-            filename = f"zone_schedule_{start_date_formatted}_{end_date_formatted}.csv"
+        start_date_formatted = start_date.replace("-", "")
+        end_date_formatted = end_date.replace("-", "")
+        date_suffix = f"{start_date_formatted}_{end_date_formatted}"
 
+        if filename is None:
+            filename = f"zone_schedule_{date_suffix}.csv"
         output_logical_path = f"04_PlanningData/{self.store_name}/{filename}"
 
-        # Save zone-level results via storage with explicit error handling
         print(
             f"[OptimizerRunner] Saving zone-level optimization results to storage path: {output_logical_path}"
         )
@@ -425,10 +434,32 @@ class OptimizerRunner:
                 f"[OptimizerRunner] Failed to save optimization results to {output_logical_path}: {error}"
             )
             raise
-
         print(
             f"[OptimizerRunner] Zone-level optimization results saved to: {output_logical_path}"
         )
+
+        # Save model and fallback outputs for comparison
+        if "optimization_result_model" in self.results and "optimization_result_fallback" in self.results:
+            try:
+                storage.write_csv(
+                    self.results["optimization_result_model"],
+                    f"04_PlanningData/{self.store_name}/zone_schedule_{date_suffix}_model.csv",
+                )
+                print(
+                    f"[OptimizerRunner] Model output saved: zone_schedule_{date_suffix}_model.csv"
+                )
+            except Exception as error:
+                print(f"[OptimizerRunner] Warning: Failed to save model output: {error}")
+            try:
+                storage.write_csv(
+                    self.results["optimization_result_fallback"],
+                    f"04_PlanningData/{self.store_name}/zone_schedule_{date_suffix}_fallback.csv",
+                )
+                print(
+                    f"[OptimizerRunner] Fallback output saved: zone_schedule_{date_suffix}_fallback.csv"
+                )
+            except Exception as error:
+                print(f"[OptimizerRunner] Warning: Failed to save fallback output: {error}")
 
         # Also save long format results
         try:
