@@ -463,7 +463,7 @@ def _viewer_html(embedded_data_json: str) -> str:
   function render(d) {
     var meta = d.meta || {};
     var html = '<h1>Optimization comparison: Legacy vs Updated</h1>';
-    html += '<div class="meta"><b>Legacy:</b> ' + escapeHtml(meta.legacy_path || '') + '<br><b>Updated:</b> ' + escapeHtml(meta.updated_path || '') + '<br><b>Generated:</b> ' + escapeHtml(meta.generated_at || '') + '</div>';
+    html += '<div class="meta"><b>Legacy:</b> ' + escapeHtml(meta.legacy_path || '') + '<br><b>Updated:</b> ' + escapeHtml(meta.updated_path || '') + '</div>';
     html += '<h2>Summary</h2>';
     html += renderTable(['metric', 'value'], (d.summary || []).map(function(r) { return { metric: r.metric, value: r.value }; }));
     html += '<h2>Total power over time (all zones)</h2><div class="chart-container"><canvas id="chartTotalPower"></canvas></div>';
