@@ -7,16 +7,16 @@ numb_units_on, ac_on_off) and power consumption only.
 
 Usage (from services/airux8-optimize):
   uv run python scripts/compare_optimization_outputs.py \\
-    --legacy data/04_PlanningData/Clea/zone_schedule_20260218_20260221_legacy.csv \\
-    --updated data/04_PlanningData/Clea/zone_schedule_20260218_20260221_updated.csv
+    --legacy data/04_PlanningData/Clea/zone_schedule_20260218_20260221_fallback.csv \\
+    --updated data/04_PlanningData/Clea/zone_schedule_20260218_20260221_model.csv
 
   uv run python scripts/compare_optimization_outputs.py \\
-    --legacy path/to/legacy.csv --updated path/to/updated.csv \\
+    --legacy path/to/fallback.csv --updated path/to/model.csv \\
     --output-dir data/04_PlanningData/Clea --report
 
   With graphs and tables (HTML report):
   uv run python scripts/compare_optimization_outputs.py \\
-    --legacy legacy.csv --updated updated.csv --output-dir ./out --html
+    --legacy fallback.csv --updated model.csv --output-dir ./out --html
 
   This writes comparison_report.html (data embedded; open in browser directly)
   and comparison_data.json (same data, for reference).
