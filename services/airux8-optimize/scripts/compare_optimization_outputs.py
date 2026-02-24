@@ -345,23 +345,45 @@ def _build_report_payload(
     }
 
 
+def _aggregate_merged_to_hourly(merged: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate merged to one row per hour; power summed, other numeric fields averaged. Datetime = start of hour (one block per hour)."""
+    if merged.empty or "datetime" not in merged.columns:
+        return merged
+    m = merged.copy()
+    m["_hour"] = pd.to_datetime(m["datetime"]).dt.floor("h")
+    agg = {}
+    for c in m.columns:
+        if c in ("datetime", "_hour"):
+            continue
+        if not pd.api.types.is_numeric_dtype(m[c]):
+            continue
+        agg[c] = "sum" if "_power_" in c else "mean"
+    if not agg:
+        return merged
+    hourly = m[["_hour"] + list(agg.keys())].groupby("_hour", as_index=False).agg(agg)
+    # Label = start of hour (00:00, 01:00, ...) so one block = one hour
+    hourly["datetime"] = hourly["_hour"]
+    return hourly.drop(columns=["_hour"])
+
+
 def _chart_data_total_power(merged: pd.DataFrame, zones: list[str]) -> dict:
-    """Chart.js data: total power (sum over zones) legacy vs updated."""
+    """Chart.js data: total power (sum over zones) legacy vs updated. One bar per hour; label = start of hour."""
     if "datetime" not in merged.columns or not zones:
         return {"labels": [], "datasets": []}
-    labels = merged["datetime"].astype(str).tolist()
-    total_legacy = pd.Series(0.0, index=merged.index)
-    total_updated = pd.Series(0.0, index=merged.index)
+    hourly = _aggregate_merged_to_hourly(merged)
+    labels = hourly["datetime"].astype(str).tolist()
+    total_legacy = pd.Series(0.0, index=hourly.index)
+    total_updated = pd.Series(0.0, index=hourly.index)
     for z in zones:
         lcol = f"{z}_power_legacy"
         ucol = f"{z}_power_updated"
-        if lcol in merged.columns:
-            total_legacy = total_legacy + merged[lcol].fillna(0).astype(float)
-        if ucol in merged.columns:
-            total_updated = total_updated + merged[ucol].fillna(0).astype(float)
+        if lcol in hourly.columns:
+            total_legacy = total_legacy + hourly[lcol].fillna(0).astype(float)
+        if ucol in hourly.columns:
+            total_updated = total_updated + hourly[ucol].fillna(0).astype(float)
     datasets = [
-        {"label": "Legacy", "data": total_legacy.tolist(), "borderColor": "rgb(54, 162, 235)", "backgroundColor": "rgba(54, 162, 235, 0.1)", "fill": False},
-        {"label": "Updated", "data": total_updated.tolist(), "borderColor": "rgb(255, 99, 132)", "backgroundColor": "rgba(255, 99, 132, 0.1)", "fill": False},
+        {"label": "Legacy", "data": total_legacy.tolist(), "backgroundColor": "rgba(59, 130, 246, 0.85)", "borderColor": "rgb(37, 99, 235)", "borderWidth": 1},
+        {"label": "Updated", "data": total_updated.tolist(), "backgroundColor": "rgba(20, 184, 166, 0.85)", "borderColor": "rgb(13, 148, 136)", "borderWidth": 1},
     ]
     return {"labels": labels, "datasets": datasets}
 
@@ -371,21 +393,22 @@ def _chart_data_by_zone(
     zones: list[str],
     value_suffix: str,
 ) -> dict:
-    """Chart.js data: per-zone legacy vs updated (power, numb_units_on, set_temp)."""
+    """Chart.js data: per-zone legacy vs updated (power, numb_units_on, set_temp). One bar per hour; label = start of hour."""
     if "datetime" not in merged.columns or not zones:
         return {"labels": [], "zones": []}
-    labels = merged["datetime"].astype(str).tolist()
+    hourly = _aggregate_merged_to_hourly(merged)
+    labels = hourly["datetime"].astype(str).tolist()
     result = {"labels": labels, "zones": []}
     for zone in zones:
         lcol = f"{zone}_{value_suffix}_legacy"
         ucol = f"{zone}_{value_suffix}_updated"
-        legacy_vals = merged[lcol].fillna(0).astype(float).tolist() if lcol in merged.columns else []
-        updated_vals = merged[ucol].fillna(0).astype(float).tolist() if ucol in merged.columns else []
+        legacy_vals = hourly[lcol].fillna(0).astype(float).tolist() if lcol in hourly.columns else []
+        updated_vals = hourly[ucol].fillna(0).astype(float).tolist() if ucol in hourly.columns else []
         result["zones"].append({
             "zone": zone,
             "datasets": [
-                {"label": "Legacy", "data": legacy_vals, "borderColor": "rgb(54, 162, 235)", "backgroundColor": "rgba(54, 162, 235, 0.1)", "fill": False},
-                {"label": "Updated", "data": updated_vals, "borderColor": "rgb(255, 99, 132)", "backgroundColor": "rgba(255, 99, 132, 0.1)", "fill": False},
+                {"label": "Legacy", "data": legacy_vals, "backgroundColor": "rgba(59, 130, 246, 0.85)", "borderColor": "rgb(37, 99, 235)", "borderWidth": 1},
+                {"label": "Updated", "data": updated_vals, "backgroundColor": "rgba(20, 184, 166, 0.85)", "borderColor": "rgb(13, 148, 136)", "borderWidth": 1},
             ],
         })
     return result
@@ -408,10 +431,11 @@ def _viewer_html(embedded_data_json: str) -> str:
     table { border-collapse: collapse; margin: 0.5rem 0; background: white; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
     th, td { border: 1px solid #ddd; padding: 0.4rem 0.6rem; text-align: left; }
     th { background: #e9ecef; }
-    .chart-container { position: relative; width: 100%; max-width: 900px; margin: 1rem 0; }
-    .chart-container canvas { max-width: 100%; }
-    .chart-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(400px, 1fr)); gap: 1.5rem; }
+    .chart-container { position: relative; width: 90vw; height: 400px; margin: 1rem 0; box-sizing: border-box; }
+    .chart-container canvas { width: 100% !important; height: 400px !important; display: block; }
+    .chart-grid { display: flex; flex-direction:column; gap: 1.5rem; }
     .meta { color: #666; font-size: 0.9rem; margin-bottom: 1rem; }
+    .zone-select { margin: 0.5rem 0 1rem 0; font-size: 1rem; padding: 0.35rem 0.5rem; }
     #loading { margin: 2rem; }
     #error { color: #c00; margin: 2rem; }
   </style>
@@ -423,8 +447,33 @@ def _viewer_html(embedded_data_json: str) -> str:
   <script id="comparison-data" type="application/json">""" + escaped_json + """</script>
   <script>
 (function() {
-  var chartOptions = { responsive: true, maintainAspectRatio: true, aspectRatio: 2.2, plugins: { legend: { position: 'top' } }, scales: { x: { ticks: { maxRotation: 45, maxTicksLimit: 20 } }, y: { beginAtZero: true } } };
-  var stepOptions = Object.assign({}, chartOptions, { datasets: { line: { stepped: true } } });
+  function formatTimeAxisLabel(val, index, ticks) {
+    var chart = this.chart;
+    if (!chart || !chart.data || !chart.data.labels) return val;
+    var lbl = chart.data.labels[val];
+    if (!lbl) return val;
+    var d = new Date(lbl);
+    if (isNaN(d.getTime())) return lbl;
+    var h = d.getHours(), m = d.getMinutes();
+    /* Midnight (00:00) = show date; else show hour (e.g. 20:00, 04:00) */
+    if (h === 0 && m === 0) return (d.getMonth() + 1) + '/' + d.getDate();
+    return ('0' + h).slice(-2) + ':00';
+  }
+  var chartOptions = {
+    responsive: true,
+    maintainAspectRatio: false,
+    plugins: { legend: { position: 'top' } },
+    scales: {
+      x: {
+        ticks: { maxRotation: 45, callback: formatTimeAxisLabel, autoSkip: false },
+        grid: { display: true, drawOnChartArea: true, color: 'rgba(0,0,0,0.12)', borderDash: [4, 4] },
+        offset: false
+      },
+      y: { beginAtZero: true, grid: { display: true, color: 'rgba(0,0,0,0.12)', borderDash: [4, 4] } }
+    },
+    datasets: { bar: { barPercentage: 0.9, categoryPercentage: 1 } }
+  };
+  var chartSingleZonePower = null;
 
   function escapeHtml(s) { var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
   function renderTable(headers, rows) {
@@ -443,33 +492,77 @@ def _viewer_html(embedded_data_json: str) -> str:
     var c = data.charts || {};
     if (c.total_power && c.total_power.labels && c.total_power.labels.length) {
       var el = document.getElementById('chartTotalPower');
-      if (el && typeof Chart !== 'undefined') new Chart(el, { type: 'line', data: c.total_power, options: chartOptions });
+      if (el && typeof Chart !== 'undefined') new Chart(el, { type: 'bar', data: c.total_power, options: chartOptions });
     }
     var gridMap = { power_by_zone: 'chartPowerByZoneGrid', units_by_zone: 'chartUnitsByZoneGrid' };
     ['power_by_zone', 'units_by_zone'].forEach(function(key) {
       var chartData = c[key];
-      var step = key === 'units_by_zone';
       var grid = document.getElementById(gridMap[key]);
       if (!grid || !chartData || !chartData.zones || !chartData.zones.length) return;
       chartData.zones.forEach(function(z) {
-        var wrap = document.createElement('div'); wrap.className = 'chart-container';
+        var wrap = document.createElement('div');
+        wrap.className = 'chart-container';
+        wrap.setAttribute('data-zone', z.zone);
         var canvas = document.createElement('canvas'); wrap.appendChild(canvas); grid.appendChild(wrap);
-        var opts = Object.assign({}, step ? stepOptions : chartOptions, { plugins: { legend: { position: 'top' }, title: { display: true, text: z.zone } } });
-        new Chart(canvas, { type: 'line', data: { labels: chartData.labels, datasets: z.datasets }, options: opts });
+        var opts = Object.assign({}, chartOptions, { plugins: { legend: { position: 'top' }, title: { display: true, text: z.zone } } });
+        new Chart(canvas, { type: 'bar', data: { labels: chartData.labels, datasets: z.datasets }, options: opts });
       });
     });
   }
 
+  function applyZoneFilter(selectedZone, data) {
+    var totalDiv = document.getElementById('totalPowerContainer');
+    var singleDiv = document.getElementById('singleZonePowerContainer');
+    var zones = document.querySelectorAll('.chart-container[data-zone]');
+    if (selectedZone === '') {
+      if (totalDiv) totalDiv.style.display = 'block';
+      if (singleDiv) singleDiv.style.display = 'none';
+      zones.forEach(function(el) { el.style.display = 'block'; });
+    } else {
+      if (totalDiv) totalDiv.style.display = 'none';
+      if (singleDiv) singleDiv.style.display = 'block';
+      zones.forEach(function(el) { el.style.display = el.getAttribute('data-zone') === selectedZone ? 'block' : 'none'; });
+      var c = data.charts || {};
+      var chartData = c.power_by_zone;
+      if (chartData && chartData.zones) {
+        var zoneObj = chartData.zones.filter(function(z) { return z.zone === selectedZone; })[0];
+        if (zoneObj) {
+          var canvas = document.getElementById('chartSingleZonePower');
+          if (canvas && typeof Chart !== 'undefined') {
+            if (chartSingleZonePower) {
+              chartSingleZonePower.data.labels = chartData.labels;
+              chartSingleZonePower.data.datasets = zoneObj.datasets;
+              chartSingleZonePower.update();
+            } else {
+              chartSingleZonePower = new Chart(canvas, { type: 'bar', data: { labels: chartData.labels, datasets: zoneObj.datasets }, options: chartOptions });
+            }
+          }
+        }
+      }
+    }
+  }
+
   function render(d) {
     var meta = d.meta || {};
+    var zones = meta.zones || [];
     var html = '<h1>Optimization comparison: Legacy vs Updated</h1>';
     html += '<div class="meta"><b>Legacy:</b> ' + escapeHtml(meta.legacy_path || '') + '<br><b>Updated:</b> ' + escapeHtml(meta.updated_path || '') + '</div>';
+    html += '<p><label>Zone: <select id="zoneSelect" class="zone-select"><option value="">All zones</option></select></label></p>';
     html += '<h2>Summary</h2>';
     html += renderTable(['metric', 'value'], (d.summary || []).map(function(r) { return { metric: r.metric, value: r.value }; }));
-    html += '<h2>Total power over time (all zones)</h2><div class="chart-container"><canvas id="chartTotalPower"></canvas></div>';
+    html += '<h2>Total power over time (all zones)</h2><div id="totalPowerContainer" class="chart-container"><canvas id="chartTotalPower"></canvas></div>';
+    html += '<h2>Power (selected zone)</h2><div id="singleZonePowerContainer" class="chart-container" style="display:none;"><canvas id="chartSingleZonePower"></canvas></div>';
     html += '<h2>Power by zone over time</h2><div class="chart-grid" id="chartPowerByZoneGrid"></div>';
     html += '<h2>AC units on by zone over time</h2><div class="chart-grid" id="chartUnitsByZoneGrid"></div>';
     document.getElementById('report').innerHTML = html;
+    var sel = document.getElementById('zoneSelect');
+    zones.forEach(function(z) {
+      var opt = document.createElement('option');
+      opt.value = z;
+      opt.textContent = z;
+      sel.appendChild(opt);
+    });
+    sel.addEventListener('change', function() { applyZoneFilter(this.value, d); });
     document.getElementById('report').style.display = 'block';
     document.getElementById('loading').style.display = 'none';
     drawCharts(d);
