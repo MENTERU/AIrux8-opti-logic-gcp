@@ -158,14 +158,14 @@ def run_comparison(
             f"Legacy zones: {zones_legacy}, Updated zones: {zones_updated}"
         )
 
-    # Align on datetime (inner join)
-    merged = legacy_df[["datetime"]].copy()
-    merged = merged.merge(
-        updated_df[["datetime"]],
-        on="datetime",
-        how="inner",
-    ).drop_duplicates()
-    merged = merged.sort_values("datetime").reset_index(drop=True)
+    # Align on datetime (outer join = union) so no rows are dropped; missing side gets NaN
+    all_dts = (
+        pd.concat([legacy_df[["datetime"]], updated_df[["datetime"]]], ignore_index=True)
+        .drop_duplicates()
+        .sort_values("datetime")
+        .reset_index(drop=True)
+    )
+    merged = all_dts.copy()
 
     # Build merged with legacy_ and updated_ prefixed columns for compare fields
     for zone in zones:
@@ -363,7 +363,17 @@ def _aggregate_merged_to_hourly(merged: pd.DataFrame) -> pd.DataFrame:
     hourly = m[["_hour"] + list(agg.keys())].groupby("_hour", as_index=False).agg(agg)
     # Label = start of hour (00:00, 01:00, ...) so one block = one hour
     hourly["datetime"] = hourly["_hour"]
-    return hourly.drop(columns=["_hour"])
+    hourly = hourly.drop(columns=["_hour"])
+    # Reindex to full hourly range so every hour has a bar (fill missing with 0)
+    hour_range = pd.date_range(
+        start=hourly["datetime"].min(),
+        end=hourly["datetime"].max(),
+        freq="h",
+        inclusive="both",
+    )
+    hourly = hourly.set_index("datetime").reindex(hour_range).fillna(0).reset_index()
+    hourly = hourly.rename(columns={"index": "datetime"})
+    return hourly
 
 
 def _chart_data_total_power(merged: pd.DataFrame, zones: list[str]) -> dict:
@@ -465,13 +475,20 @@ def _viewer_html(embedded_data_json: str) -> str:
     plugins: { legend: { position: 'top' } },
     scales: {
       x: {
+        stacked: true,
         ticks: { maxRotation: 45, callback: formatTimeAxisLabel, autoSkip: false },
         grid: { display: true, drawOnChartArea: true, color: 'rgba(0,0,0,0.12)', borderDash: [4, 4] },
-        offset: false
+        border: { display: true, color: 'rgba(0,0,0,0.25)', width: 1 },
+        offset: true
       },
-      y: { beginAtZero: true, grid: { display: true, color: 'rgba(0,0,0,0.12)', borderDash: [4, 4] } }
+      y: {
+        stacked: true,
+        beginAtZero: true,
+        grid: { display: true, color: 'rgba(0,0,0,0.12)', borderDash: [4, 4] },
+        border: { display: true, color: 'rgba(0,0,0,0.25)', width: 1 }
+      }
     },
-    datasets: { bar: { barPercentage: 0.9, categoryPercentage: 1 } }
+    datasets: { bar: { barPercentage: 1, categoryPercentage: 1 } }
   };
   var chartSingleZonePower = null;
 
