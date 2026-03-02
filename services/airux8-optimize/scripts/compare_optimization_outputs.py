@@ -12,14 +12,9 @@ Usage (from services/airux8-optimize):
 
   uv run python scripts/compare_optimization_outputs.py \\
     --legacy path/to/fallback.csv --updated path/to/model.csv \\
-    --output-dir data/04_PlanningData/Clea --report
+    --output-dir data/04_PlanningData/Clea
 
-  With graphs and tables (HTML report):
-  uv run python scripts/compare_optimization_outputs.py \\
-    --legacy fallback.csv --updated model.csv --output-dir ./out --html
-
-  This writes comparison_report.html (data embedded; open in browser directly)
-  and comparison_data.json (same data, for reference).
+  Writes comparison_report.html (data embedded; open in browser directly).
 """
 
 from __future__ import annotations
@@ -66,22 +61,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--output-dir",
         default=None,
-        help="If set, write comparison_report.csv and comparison_summary.txt here.",
-    )
-    p.add_argument(
-        "--report",
-        action="store_true",
-        help="Write diff report files (requires --output-dir or writes to cwd).",
+        help="Directory for comparison_report.html (default: current directory).",
     )
     p.add_argument(
         "--zones",
         default=None,
         help="Comma-separated zone names to compare (default: all zones present in both files).",
-    )
-    p.add_argument(
-        "--html",
-        action="store_true",
-        help="Generate HTML report with tables and graphs (writes to --output-dir or current dir).",
     )
     p.add_argument(
         "--diff-table-rows",
@@ -335,7 +320,7 @@ def _build_report_payload(
         "diff_by_zone": by_zone,
         "diff_by_field": by_field,
         "diff_table": diff_table,
-        "diff_table_note": f"Showing up to {max_diff_table_rows} rows. Full list in comparison_report.csv.",
+        "diff_table_note": f"Showing up to {max_diff_table_rows} rows.",
         "charts": {
             "total_power": chart_total_power,
             "power_by_zone": chart_power_by_zone,
@@ -591,7 +576,7 @@ def _viewer_html(embedded_data_json: str) -> str:
   else {
     document.getElementById('loading').style.display = 'none';
     document.getElementById('error').style.display = 'block';
-    document.getElementById('error').textContent = 'No comparison data. Run compare_optimization_outputs.py with --html first.';
+    document.getElementById('error').textContent = 'No comparison data. Run compare_optimization_outputs.py to generate the report.';
   }
 })();
   </script>
@@ -609,7 +594,7 @@ def _write_html_report(
     output_dir: Path,
     max_diff_table_rows: int = 200,
 ) -> Path:
-    """Write comparison_report.html with data embedded (works when opened from file). Optionally write comparison_data.json."""
+    """Write comparison_report.html with data embedded (works when opened from file)."""
     zones = stats["zones"]
     chart_total_power = _chart_data_total_power(merged, zones)
     chart_power_by_zone = _chart_data_by_zone(merged, zones, "power")
@@ -646,10 +631,6 @@ def _write_html_report(
         payload_json = json.dumps(payload_safe, default=_json_default)
     html_path = output_dir / "comparison_report.html"
     html_path.write_text(_viewer_html(payload_json), encoding="utf-8")
-
-    json_path = output_dir / "comparison_data.json"
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(payload_safe, f, default=_json_default, indent=2)
 
     return html_path
 
@@ -705,47 +686,23 @@ def main() -> int:
             print(f"  {f}: {stats['diff_by_field'].get(f, 0)}")
     print("=" * 60)
 
-    out_dir = None
-    if args.output_dir:
-        out_dir = Path(args.output_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
-    elif args.report or args.html:
-        out_dir = Path.cwd()
+    out_dir = Path(args.output_dir) if args.output_dir else Path.cwd()
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.html:
-        if out_dir is None:
-            out_dir = Path.cwd()
-        try:
-            html_path = _write_html_report(
-                merged,
-                diff_df,
-                stats,
-                legacy_path,
-                updated_path,
-                out_dir,
-                max_diff_table_rows=args.diff_table_rows,
-            )
-            print(f"Wrote HTML report: {html_path}")
-        except Exception as e:
-            print(f"Error generating HTML report: {e}", file=sys.stderr)
-            return 1
-        # Write CSV so "full list in comparison_report.csv" in HTML is valid
-        if not diff_df.empty:
-            diff_df.to_csv(out_dir / "comparison_report.csv", index=False)
-
-    if args.report and out_dir is not None:
-        summary_path = out_dir / "comparison_summary.txt"
-        report_path = out_dir / "comparison_report.csv"
-        with open(summary_path, "w", encoding="utf-8") as f:
-            f.write("Optimization output comparison (Legacy vs Updated)\n")
-            f.write(f"Legacy: {legacy_path}\n")
-            f.write(f"Updated: {updated_path}\n")
-            f.write(f"Rows: {stats['total_rows']}, Rows with diff: {stats['rows_with_any_diff']}, Total diffs: {stats['total_diffs']}\n")
-            f.write(f"Power legacy: {stats['total_power_legacy']:.0f}, updated: {stats['total_power_updated']:.0f}, delta: {stats['power_delta']:+.0f}\n")
-        if not diff_df.empty:
-            diff_df.to_csv(report_path, index=False)
-            print(f"Wrote diff report: {report_path}")
-        print(f"Wrote summary: {summary_path}")
+    try:
+        html_path = _write_html_report(
+            merged,
+            diff_df,
+            stats,
+            legacy_path,
+            updated_path,
+            out_dir,
+            max_diff_table_rows=args.diff_table_rows,
+        )
+        print(f"Wrote HTML report: {html_path}")
+    except Exception as e:
+        print(f"Error generating HTML report: {e}", file=sys.stderr)
+        return 1
 
     return 0
 
