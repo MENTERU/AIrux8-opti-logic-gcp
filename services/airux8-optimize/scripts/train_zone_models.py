@@ -18,6 +18,8 @@ def main():
     parser = argparse.ArgumentParser(description="Train zone models and save to 03_Models")
     parser.add_argument("--store", default="Clea", help="Store name (default: Clea)")
     parser.add_argument("--min-samples", type=int, default=100, help="Min samples per zone (default: 100)")
+    parser.add_argument("--val-ratio", type=float, default=0.2, help="Validation fraction for time-based split (default: 0.2)")
+    parser.add_argument("--no-validation", action="store_true", help="Skip validation metrics (train on full data only)")
     args = parser.parse_args()
 
     processed_dir = get_data_path("processed_data_path")
@@ -30,6 +32,8 @@ def main():
     print(f"Training zone models for store: {args.store}")
     print(f"Features: {features_path}")
     print(f"Min samples per zone: {args.min_samples}")
+    if not args.no_validation:
+        print(f"Validation: time-based split (last {args.val_ratio*100:.0f}% as validation)")
 
     saved = train_and_save_all_zones(
         features_csv_path=features_path,
@@ -37,6 +41,8 @@ def main():
         power_model_type="ridge",
         temp_model_type="ridge",
         min_samples=args.min_samples,
+        val_ratio=args.val_ratio,
+        run_validation=not args.no_validation,
     )
 
     if saved:
