@@ -1432,6 +1432,13 @@ class Optimizer:
             # When AC is OFF, power must be 0 (model may predict non-zero)
             power_value = int(round(float(pred_power[best_idx])))if units_count > 0 else 0.0
 
+            # Historical reference: all from the chosen candidate row (best is from zone_hist: Datetime, Outdoor Temp., Solar Radiation, Indoor Temp.)
+            hist_datetime_used = best.get("Datetime")
+            hist_outdoor_temp = best.get("Outdoor Temp.") if pd.notna(best.get("Outdoor Temp.")) else forecast_row.get("Outdoor Temp.")
+            hist_solar_radiation = best.get("Solar Radiation") if pd.notna(best.get("Solar Radiation")) else forecast_row.get("Solar Radiation")
+            hist_indoor_val = best.get("Indoor Temp.")
+            hist_indoor_temp = f"{float(hist_indoor_val):.1f}" if pd.notna(hist_indoor_val) else f"{float(last_predicted_temp):.1f}"
+
             results.append({
                 "datetime": forecast_datetime,
                 "zone": zone,
@@ -1442,12 +1449,12 @@ class Optimizer:
                 "ac_on_off": self._map_ac_on_off(units_count),
                 "power": power_value,
                 "indoor_temp": f"{float(last_predicted_temp):.1f}",
-                "hist_datetime_used": None,
+                "hist_datetime_used": hist_datetime_used,
                 "forecast_outdoor_temp": forecast_row.get("Outdoor Temp."),
                 "forecast_solar_radiation": forecast_row.get("Solar Radiation"),
-                "hist_outdoor_temp": forecast_row.get("Outdoor Temp."),
-                "hist_solar_radiation": forecast_row.get("Solar Radiation"),
-                "hist_indoor_temp": f"{float(last_predicted_temp):.1f}",
+                "hist_outdoor_temp": hist_outdoor_temp,
+                "hist_solar_radiation": hist_solar_radiation,
+                "hist_indoor_temp": hist_indoor_temp,
             })
 
         if not results:

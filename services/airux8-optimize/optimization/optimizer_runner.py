@@ -224,7 +224,7 @@ class OptimizerRunner:
             # Load data (master data and weather forecast)
             self.load_weather_data(start_date, end_date)
 
-            # Run optimization twice: model-based and legacy fallback (for comparison)
+            # Run optimization twice: model-based and fallback (for comparison and separate CSVs)
             optimizer_model = Optimizer(
                 store_name=self.store_name,
                 use_operating_hours=False,
@@ -281,9 +281,10 @@ class OptimizerRunner:
                 print(
                     f"[OptimizerRunner] Warning: Failed to generate unit-level format: {e}"
                 )
+                # Don't fail the whole optimization if unit format generation fails
 
             print(
-                f"[OptimizerRunner] Zone optimization completed: model={len(result_model)} rows, fallback={len(result_fallback)} rows"
+                f"[OptimizerRunner] Zone optimization completed successfully: {len(result_fallback)} results (fallback), {len(result_model)} results (model)"
             )
             return self.results
 
@@ -416,14 +417,16 @@ class OptimizerRunner:
         # Output path (storage-backed)
         storage = get_storage_client()
 
-        start_date_formatted = start_date.replace("-", "")
-        end_date_formatted = end_date.replace("-", "")
-        date_suffix = f"{start_date_formatted}_{end_date_formatted}"
-
+        # Generate filename with start and end dates
         if filename is None:
-            filename = f"zone_schedule_{date_suffix}.csv"
+            # Convert dates to YYYYMMDD format
+            start_date_formatted = start_date.replace("-", "")
+            end_date_formatted = end_date.replace("-", "")
+            filename = f"zone_schedule_{start_date_formatted}_{end_date_formatted}.csv"
+
         output_logical_path = f"04_PlanningData/{self.store_name}/{filename}"
 
+        # Save zone-level results via storage with explicit error handling
         print(
             f"[OptimizerRunner] Saving zone-level optimization results to storage path: {output_logical_path}"
         )
@@ -434,34 +437,30 @@ class OptimizerRunner:
                 f"[OptimizerRunner] Failed to save optimization results to {output_logical_path}: {error}"
             )
             raise
+
         print(
             f"[OptimizerRunner] Zone-level optimization results saved to: {output_logical_path}"
         )
 
-        # Save model and fallback outputs for comparison (2 outputs for compare_optimization_outputs.py)
-        if "optimization_result_model" in self.results and "optimization_result_fallback" in self.results:
-            model_path = f"04_PlanningData/{self.store_name}/zone_schedule_{date_suffix}_model.csv"
-            fallback_path = f"04_PlanningData/{self.store_name}/zone_schedule_{date_suffix}_fallback.csv"
-            try:
-                storage.write_csv(
-                    self.results["optimization_result_model"],
-                    model_path,
-                )
-                print(
-                    f"[OptimizerRunner] Model output saved: zone_schedule_{date_suffix}_model.csv"
-                )
-            except Exception as error:
-                print(f"[OptimizerRunner] Warning: Failed to save model output: {error}")
-            try:
-                storage.write_csv(
-                    self.results["optimization_result_fallback"],
-                    fallback_path,
-                )
-                print(
-                    f"[OptimizerRunner] Fallback output saved: zone_schedule_{date_suffix}_fallback.csv"
-                )
-            except Exception as error:
-                print(f"[OptimizerRunner] Warning: Failed to save fallback output: {error}")
+        # Save model and fallback CSVs for comparison (same dates)
+        start_date_formatted = start_date.replace("-", "")
+        end_date_formatted = end_date.replace("-", "")
+        for key, suffix in [
+            ("optimization_result_model", "_model"),
+            ("optimization_result_fallback", "_fallback"),
+        ]:
+            if key in self.results and not self.results[key].empty:
+                extra_filename = f"zone_schedule_{start_date_formatted}_{end_date_formatted}{suffix}.csv"
+                extra_path = f"04_PlanningData/{self.store_name}/{extra_filename}"
+                try:
+                    storage.write_csv(self.results[key], extra_path)
+                    print(
+                        f"[OptimizerRunner] {suffix.lstrip('_')} results saved to: {extra_path}"
+                    )
+                except Exception as error:
+                    print(
+                        f"[OptimizerRunner] Warning: Failed to save {suffix.lstrip('_')} results to {extra_path}: {error}"
+                    )
 
         # Also save long format results
         try:
