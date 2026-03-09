@@ -270,18 +270,41 @@ class OptimizerRunner:
                 )
                 if not unit_result_df.empty:
                     self.results["optimization_result_units"] = unit_result_df
+                    self.results["optimization_result_units_fallback"] = unit_result_df
                     print(
-                        f"[OptimizerRunner] Unit-level optimization result generated: {len(unit_result_df)} results"
+                        f"[OptimizerRunner] Unit-level optimization result (fallback) generated: {len(unit_result_df)} results"
                     )
                 else:
                     print(
-                        "[OptimizerRunner] Warning: Unit-level optimization result is empty"
+                        "[OptimizerRunner] Warning: Unit-level optimization result (fallback) is empty"
                     )
             except Exception as e:
                 print(
-                    f"[OptimizerRunner] Warning: Failed to generate unit-level format: {e}"
+                    f"[OptimizerRunner] Warning: Failed to generate unit-level format (fallback): {e}"
                 )
                 # Don't fail the whole optimization if unit format generation fails
+
+            # Unit-level format from model
+            if not result_model.empty:
+                try:
+                    unit_result_model_df = self.optimizer.get_unit_format(
+                        result_model, self.master_data
+                    )
+                    if not unit_result_model_df.empty:
+                        self.results["optimization_result_units_model"] = (
+                            unit_result_model_df
+                        )
+                        print(
+                            f"[OptimizerRunner] Unit-level optimization result (model) generated: {len(unit_result_model_df)} results"
+                        )
+                    else:
+                        print(
+                            "[OptimizerRunner] Warning: Unit-level optimization result (model) is empty"
+                        )
+                except Exception as e:
+                    print(
+                        f"[OptimizerRunner] Warning: Failed to generate unit-level format (model): {e}"
+                    )
 
             print(
                 f"[OptimizerRunner] Zone optimization completed successfully: {len(result_fallback)} results (fallback), {len(result_model)} results (model)"
@@ -485,18 +508,35 @@ class OptimizerRunner:
             )
             # Don't raise - wide format results are already saved
 
-        # Also save unit-level results if available
+        # Save unit-level results (fallback and model) for comparison
+        start_date_formatted = start_date.replace("-", "")
+        end_date_formatted = end_date.replace("-", "")
+        for key, suffix in [
+            ("optimization_result_units_fallback", "_fallback"),
+            ("optimization_result_units_model", "_model"),
+        ]:
+            if key in self.results and not self.results[key].empty:
+                unit_filename = (
+                    f"unit_schedule_{start_date_formatted}_{end_date_formatted}{suffix}.csv"
+                )
+                unit_path = f"04_PlanningData/{self.store_name}/{unit_filename}"
+                try:
+                    storage.write_csv(self.results[key], unit_path)
+                    print(
+                        f"[OptimizerRunner] Unit-level {suffix.lstrip('_')} results saved to: {unit_path}"
+                    )
+                except Exception as error:
+                    print(
+                        f"[OptimizerRunner] Warning: Failed to save unit-level {suffix.lstrip('_')} results to {unit_path}: {error}"
+                    )
+        # Backward compatibility: also write fallback unit schedule without suffix
         if "optimization_result_units" in self.results:
-            # Generate unit-level filename
-            start_date_formatted = start_date.replace("-", "")
-            end_date_formatted = end_date.replace("-", "")
             unit_filename = (
                 f"unit_schedule_{start_date_formatted}_{end_date_formatted}.csv"
             )
             unit_output_logical_path = (
                 f"04_PlanningData/{self.store_name}/{unit_filename}"
             )
-
             print(
                 f"[OptimizerRunner] Saving unit-level optimization results to storage path: {unit_output_logical_path}"
             )
