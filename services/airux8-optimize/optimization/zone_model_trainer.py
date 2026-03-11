@@ -285,7 +285,11 @@ def train_and_save_all_zones(
     if "IsWeekend" not in df.columns:
         df["IsWeekend"] = (df["DayOfWeek"] >= 5).astype(int)
     if "IsHoliday" not in df.columns:
-        df["IsHoliday"] = 0
+        try:
+            import jpholiday  # type: ignore
+            df["IsHoliday"] = df["Datetime"].dt.date.map(lambda d: 1 if jpholiday.is_holiday(d) else 0).astype(int)
+        except Exception:
+            df["IsHoliday"] = 0
 
     saved = []
     for zone in df["zone"].unique():

@@ -20,6 +20,14 @@ from processing.utilities.master_data_loader import (
     get_zone_operating_hours,
 )
 
+def _is_holiday(d: date) -> bool:
+    """True if d is a Japanese holiday (uses jpholiday if available)."""
+    try:
+        import jpholiday  # type: ignore
+        return bool(jpholiday.is_holiday(d))
+    except Exception:
+        return False
+
 
 class Optimizer:
     """
@@ -568,7 +576,7 @@ class Optimizer:
         forecast_dt = pd.to_datetime(forecast_day_data["datetime"].iloc[0])
         f_dow = forecast_dt.dayofweek  # 0=Mon, 6=Sun
         f_weekend = 1 if f_dow in (5, 6) else 0
-        f_holiday = 0  # optional: set from calendar if available
+        f_holiday = 1 if _is_holiday(forecast_dt.date()) else 0
         if "DayOfWeek" in zone_data.columns and "IsWeekend" in zone_data.columns:
             day_meta = (
                 zone_data.groupby("Date")[["DayOfWeek", "IsWeekend"]]
@@ -1350,10 +1358,11 @@ class Optimizer:
             month = forecast_datetime.month
             day_of_week = forecast_datetime.dayofweek
             is_weekend = 1 if day_of_week >= 5 else 0
-            is_holiday = 0  # Could be from master/calendar if needed
+            is_holiday = 1 if _is_holiday(forecast_datetime.date()) else 0
 
             # Build feature matrix: one row per candidate
             rows = []
+            units_on_list: list[int] = []
             for _, pat in candidates_df.iterrows():
                 set_temp = pat.get("A/C Set Temperature")
                 ac_status = pat.get("A/C Status")
@@ -1389,6 +1398,9 @@ class Optimizer:
                     "IsHoliday": is_holiday,
                 }
                 rows.append(row)
+                units_on_list.append(
+                    min(int(pat.get("A/C ON/OFF", 0) or 0), max_units)
+                )
 
             X = pd.DataFrame(rows)
             # Align columns to model's feature_names order; fill missing with impute
@@ -1398,19 +1410,49 @@ class Optimizer:
             X = X[feature_names].astype(float)
 
             pred_power = power_pipe.predict(X)
-            pred_temp = temp_pipe.predict(X) if temp_pipe else np.full(len(X), last_predicted_temp)
+            pred_temp = (
+                temp_pipe.predict(X) if temp_pipe else np.full(len(X), last_predicted_temp)
+            )
 
-            # Comfort filter
+            # Model path: comfort-aware scoring (prefer in-band, penalize outside); winter nights avoid fully OFF
             try:
                 comfort_min, comfort_max = get_comfort_range(master_data, zone, month)
             except Exception:
                 comfort_min, comfort_max = 22.0, 28.0
-            in_comfort = (pred_temp >= comfort_min) & (pred_temp <= comfort_max)
-            if not in_comfort.any():
-                in_comfort = np.ones(len(pred_temp), dtype=bool)
 
-            valid_power = np.where(in_comfort, pred_power, np.inf)
-            best_idx = int(np.argmin(valid_power))
+            lower_violation = np.maximum(0.0, comfort_min - pred_temp)
+            upper_violation = np.maximum(0.0, pred_temp - comfort_max)
+            comfort_violation = lower_violation + upper_violation
+
+            energy_term = pred_power.astype(float) / 1000.0
+            COMFORT_WEIGHT = 100.0
+            score = energy_term + COMFORT_WEIGHT * comfort_violation
+
+            # Winter (Dec–Feb) nights 00:00–06:59: prefer OFF when unoccupied unless comfort violated
+            # If temp in band (no violation): penalize running units so we prefer OFF. If temp too low: penalize OFF so we allow heating.
+            units_on = np.array(units_on_list, dtype=float)
+            if month in (12, 1, 2) and 0 <= hour < 7:
+                in_comfort = (comfort_violation <= 0.0)
+                # Prefer OFF at night when comfort is OK (penalize candidates with units on)
+                NIGHT_ON_PENALTY = 300.0
+                score = score + NIGHT_ON_PENALTY * units_on * in_comfort.astype(float)
+                # When comfort violated (too cold), prefer some units ON (penalize fully OFF)
+                NO_HEATING_NIGHT_PENALTY = 500.0
+                off_mask = units_on <= 0
+                score = score + NO_HEATING_NIGHT_PENALTY * off_mask.astype(float) * (~in_comfort).astype(float)
+
+            # Winter (Dec–Feb) daytime 06:00–17:59 (typical occupied hours): when cold outside, prefer some heating
+            # Model may over-predict indoor temp when AC is OFF; penalize fully OFF so occupied hours get heating
+            out_temp_val = forecast_row.get("Outdoor Temp.")
+            if pd.isna(out_temp_val):
+                out_temp_val = 10.0  # treat missing as cold so we apply daytime heating penalty
+            out_cold = float(out_temp_val) < 15.0
+            if month in (12, 1, 2) and 6 <= hour < 18 and out_cold:
+                off_mask = units_on <= 0
+                DAYTIME_COLD_OFF_PENALTY = 800.0
+                score = score + DAYTIME_COLD_OFF_PENALTY * off_mask.astype(float)
+
+            best_idx = int(np.argmin(score))
             best = candidates_df.iloc[best_idx]
             last_predicted_temp = float(pred_temp[best_idx])
 
@@ -1429,8 +1471,9 @@ class Optimizer:
             else:
                 fan_speed_value = int(fan_speed_value)
 
-            # When AC is OFF, power must be 0 (model may predict non-zero)
-            power_value = int(round(float(pred_power[best_idx])))if units_count > 0 else 0.0
+            # When AC is OFF, power must be 0 (model may predict non-zero). Clamp to >= 0 (model can predict negative)
+            raw_power = float(pred_power[best_idx]) if units_count > 0 else 0.0
+            power_value = max(0, int(round(raw_power)))
 
             # Historical reference: all from the chosen candidate row (best is from zone_hist: Datetime, Outdoor Temp., Solar Radiation, Indoor Temp.)
             hist_datetime_used = best.get("Datetime")

@@ -15,6 +15,13 @@ Usage (from services/airux8-optimize):
     --output-dir data/04_PlanningData/Clea
 
   Writes comparison_report.html (data embedded; open in browser directly).
+
+  To see updated 台モード (model output) in the report:
+  1. Run optimization first (writes unit_schedule_*_model.csv):
+       uv run main.py --optimize --start-date 2025-01-07 --end-date 2025-01-07
+  2. Then run this compare script with --updated pointing to zone_schedule_*_model.csv.
+  3. Open the new comparison_report.html (hard refresh / clear cache if needed).
+  Note: Running optimization/optimizer.py directly does not write any CSV; use main.py --optimize.
 """
 
 from __future__ import annotations
@@ -22,8 +29,9 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -302,9 +310,9 @@ def run_comparison(
         pcol_l = f"{zone}_power_legacy"
         pcol_u = f"{zone}_power_updated"
         if pcol_l in merged.columns:
-            total_power_legacy += merged[pcol_l].fillna(0).astype(float).sum()
+            total_power_legacy += merged[pcol_l].fillna(0).astype(float).clip(lower=0).sum()
         if pcol_u in merged.columns:
-            total_power_updated += merged[pcol_u].fillna(0).astype(float).sum()
+            total_power_updated += merged[pcol_u].fillna(0).astype(float).clip(lower=0).sum()
 
     stats = {
         "total_rows": total_rows,
@@ -385,6 +393,250 @@ def _resolve_unit_schedule_path(zone_schedule_path: Path) -> Path:
     return zone_schedule_path.parent / name.replace("zone_schedule_", "unit_schedule_", 1)
 
 
+def _parse_date_range_from_legacy_path(legacy_path: Path) -> tuple[str, str] | None:
+    """Parse zone_schedule_YYYYMMDD_YYYYMMDD_*.csv into (start_YYYYMMDD, end_YYYYMMDD). Returns None if pattern not matched."""
+    name = legacy_path.name
+    m = re.match(r"zone_schedule_(\d{8})_(\d{8})_", name)
+    if m:
+        return m.group(1), m.group(2)
+    return None
+
+
+def _find_ac_control_file_for_date(ac_control_dir: Path, date_str: str) -> Path | None:
+    """Find one ac-control CSV that contains the given date (YYYY-MM-DD or YYYYMMDD). Used when only one file is needed."""
+    files = _find_all_ac_control_files_for_date(ac_control_dir, date_str)
+    return files[0] if files else None
+
+
+def _find_all_ac_control_files_for_date(ac_control_dir: Path, date_str: str) -> list[Path]:
+    """Find all ac-control CSVs that contain the given date. Multiple files may exist for the same range with different units (e.g. Area 1 vs others)."""
+    if not ac_control_dir.is_dir():
+        return []
+    if len(date_str) == 8:
+        target = pd.to_datetime(f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}").date()
+    else:
+        target = pd.to_datetime(date_str).date()
+    out = []
+    for f in sorted(ac_control_dir.glob("ac-control-*-logs-*.csv")):
+        parts = f.stem.split("-")
+        if len(parts) >= 6:
+            try:
+                start = pd.to_datetime(f"{parts[-6]}-{parts[-5]}-{parts[-4]}").date()
+                end = pd.to_datetime(f"{parts[-3]}-{parts[-2]}-{parts[-1]}").date()
+                if start <= target <= end:
+                    out.append(f)
+            except Exception:
+                pass
+    return out
+
+
+def _load_unit_schedule_from_ac_logs(
+    store: str,
+    start_yyyymmdd: str,
+    end_yyyymmdd: str,
+    unit_ids: list[str],
+    ac_control_dir: Path,
+) -> pd.DataFrame | None:
+    """
+    Build unit-level schedule (wide: Date Time + *_Mode, *_OnOFF, etc.) from ac-control log CSVs.
+    Same data source and hourly aggregation as show_ac_settings_by_units (--hourly).
+    Returns DataFrame compatible with _unit_mode_from_schedule, or None if no data.
+    """
+    if not unit_ids or not ac_control_dir.is_dir():
+        return None
+    unit_set = {str(u).strip() for u in unit_ids}
+    start_d = pd.to_datetime(f"{start_yyyymmdd[:4]}-{start_yyyymmdd[4:6]}-{start_yyyymmdd[6:8]}").date()
+    end_d = pd.to_datetime(f"{end_yyyymmdd[:4]}-{end_yyyymmdd[4:6]}-{end_yyyymmdd[6:8]}").date()
+    # For each date, consider all ac-control files that cover that date (different files may have different units, e.g. Area 1 vs others). Filter by unit name (e.g. E-10南2) and merge.
+    all_rows = []
+    d = start_d
+    while d <= end_d:
+        date_str = d.strftime("%Y-%m-%d")
+        ac_files = _find_all_ac_control_files_for_date(ac_control_dir, date_str)
+        day_rows = []
+        for ac_file in ac_files:
+            try:
+                df = pd.read_csv(ac_file)
+            except Exception:
+                continue
+            if "A/C Name" not in df.columns or "Datetime" not in df.columns:
+                continue
+            df["Datetime"] = pd.to_datetime(df["Datetime"])
+            df["Date"] = df["Datetime"].dt.date
+            mask_date = df["Date"] == d
+            mask_unit = df["A/C Name"].astype(str).str.strip().isin(unit_set)
+            out = df.loc[mask_date & mask_unit].copy()
+            if out.empty:
+                continue
+            out["Hour"] = out["Datetime"].dt.floor("h")
+            grouped = (
+                out.sort_values(["A/C Name", "Datetime"])
+                .groupby(["A/C Name", "Hour"], as_index=False)
+                .last()
+            )
+            if "Datetime" in grouped.columns:
+                grouped = grouped.drop(columns=["Datetime"])
+            grouped = grouped.rename(columns={"Hour": "Datetime"})
+            for _, row in grouped.iterrows():
+                day_rows.append({
+                    "Datetime": row["Datetime"],
+                    "A/C Name": row["A/C Name"],
+                    "A/C ON/OFF": row.get("A/C ON/OFF"),
+                    "A/C Mode": row.get("A/C Mode"),
+                    "A/C Set Temperature": row.get("A/C Set Temperature"),
+                    "A/C Fan Speed": row.get("A/C Fan Speed"),
+                })
+        # Deduplicate by (A/C Name, Hour): same unit may appear in more than one file; keep last
+        if day_rows:
+            day_df = pd.DataFrame(day_rows)
+            day_df = day_df.sort_values(["A/C Name", "Datetime"]).groupby(["A/C Name", "Datetime"], as_index=False).last()
+            for _, row in day_df.iterrows():
+                all_rows.append({
+                    "Datetime": row["Datetime"],
+                    "A/C Name": row["A/C Name"],
+                    "A/C ON/OFF": row.get("A/C ON/OFF"),
+                    "A/C Mode": row.get("A/C Mode"),
+                    "A/C Set Temperature": row.get("A/C Set Temperature"),
+                    "A/C Fan Speed": row.get("A/C Fan Speed"),
+                })
+        d += timedelta(days=1)
+    if not all_rows:
+        return None
+    long_df = pd.DataFrame(all_rows)
+    # Pivot to wide: one row per Datetime (hour), columns = Date Time, then for each unit: UnitId_OnOFF, UnitId_Mode, UnitId_SetTemp, UnitId_FanSpeed
+    long_df["Date Time"] = long_df["Datetime"].dt.strftime("%Y/%m/%d %H:%M")
+    unit_order = sorted(unit_set)
+    wide_rows = []
+    for dt, grp in long_df.groupby(["Datetime"]):
+        row = {"Date Time": grp["Date Time"].iloc[0]}
+        for uid in unit_order:
+            u = grp[grp["A/C Name"].astype(str).str.strip() == uid]
+            if u.empty:
+                row[f"{uid}_OnOFF"] = "OFF"
+                row[f"{uid}_Mode"] = "OFF"
+                row[f"{uid}_SetTemp"] = None
+                row[f"{uid}_FanSpeed"] = "AUTO"
+            else:
+                r = u.iloc[0]
+                on_off = r.get("A/C ON/OFF")
+                row[f"{uid}_OnOFF"] = "ON" if (on_off is not None and str(on_off).strip().upper() == "ON") else "OFF"
+                mode = r.get("A/C Mode")
+                if mode is None or pd.isna(mode):
+                    row[f"{uid}_Mode"] = "OFF"
+                else:
+                    v = str(mode).strip().upper()
+                    row[f"{uid}_Mode"] = v if v in ("COOL", "HEAT", "FAN") else "OFF"
+                row[f"{uid}_SetTemp"] = r.get("A/C Set Temperature")
+                fs = r.get("A/C Fan Speed")
+                row[f"{uid}_FanSpeed"] = "AUTO" if fs is None or pd.isna(fs) else str(fs).strip()
+        wide_rows.append(row)
+    wide_df = pd.DataFrame(wide_rows)
+    # Sort by Date Time (parse as datetime for correct chronological order)
+    wide_df["_dt"] = pd.to_datetime(wide_df["Date Time"], format="%Y/%m/%d %H:%M", errors="coerce")
+    wide_df = wide_df.sort_values("_dt").drop(columns=["_dt"]).reset_index(drop=True)
+    return wide_df
+
+
+def _write_ac_logs_by_zone(
+    unit_legacy_df: pd.DataFrame,
+    zone_to_units: dict[str, list[str]],
+    output_path: Path,
+) -> None:
+    """
+    Write a CSV of AC log data zone by zone (one row per Zone, Date Time, A/C Name, OnOFF, Mode, SetTemp, FanSpeed).
+    Used to show what AC log data was loaded for each zone before comparison.
+    """
+    if unit_legacy_df.empty or not zone_to_units:
+        return
+    dt_col = "Date Time" if "Date Time" in unit_legacy_df.columns else "datetime"
+    if dt_col not in unit_legacy_df.columns:
+        return
+    rows = []
+    for _, row in unit_legacy_df.iterrows():
+        date_time = row[dt_col]
+        for zone, uids in zone_to_units.items():
+            for uid in (uids or []):
+                onoff_col = f"{uid}_OnOFF"
+                mode_col = f"{uid}_Mode"
+                settemp_col = f"{uid}_SetTemp"
+                fanspeed_col = f"{uid}_FanSpeed"
+                if mode_col not in row.index:
+                    continue
+                rows.append({
+                    "Zone": zone,
+                    "Date Time": date_time,
+                    "A/C Name": uid,
+                    "OnOFF": row.get(onoff_col, ""),
+                    "Mode": row.get(mode_col, ""),
+                    "SetTemp": row.get(settemp_col, ""),
+                    "FanSpeed": row.get(fanspeed_col, ""),
+                })
+    if not rows:
+        return
+    out_df = pd.DataFrame(rows)
+    out_df = out_df.sort_values(["Zone", "A/C Name", "Date Time"]).reset_index(drop=True)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    out_df.to_csv(output_path, index=False)
+    print(f"Wrote AC logs by zone: {output_path} ({len(out_df)} rows)", file=sys.stderr)
+
+
+def _write_hourly_units_by_zone(
+    unit_legacy_df: pd.DataFrame,
+    zone_to_units: dict[str, list[str]],
+    output_path: Path,
+) -> None:
+    """
+    Write a CSV of hourly unit data zone by zone: one row per (Zone, Date Time)
+    with columns Zone, Date Time, then for each unit slot: UnitN_A/C Name, UnitN_OnOFF, UnitN_Mode, UnitN_SetTemp, UnitN_FanSpeed.
+    So for Area 1 at 00:00 you get one row with that zone's 8 units' status in columns.
+    """
+    if unit_legacy_df.empty or not zone_to_units:
+        return
+    dt_col = "Date Time" if "Date Time" in unit_legacy_df.columns else "datetime"
+    if dt_col not in unit_legacy_df.columns:
+        return
+    max_units = max(len([u for u in (uids or []) if f"{u}_Mode" in unit_legacy_df.columns]) for uids in zone_to_units.values())
+    if max_units <= 0:
+        return
+    base_cols = ["Zone", "Date Time"]
+    unit_cols = []
+    for i in range(1, max_units + 1):
+        unit_cols.extend([f"Unit{i}_A/C Name", f"Unit{i}_OnOFF", f"Unit{i}_Mode", f"Unit{i}_SetTemp", f"Unit{i}_FanSpeed"])
+    columns = base_cols + unit_cols
+    rows = []
+    for _, row in unit_legacy_df.iterrows():
+        date_time = row[dt_col]
+        for zone, uids in zone_to_units.items():
+            legacy_uids = [uid for uid in (uids or []) if f"{uid}_Mode" in row.index]
+            if not legacy_uids:
+                continue
+            out_row = {"Zone": zone, "Date Time": date_time}
+            for i, uid in enumerate(legacy_uids):
+                if i >= max_units:
+                    break
+                n = i + 1
+                out_row[f"Unit{n}_A/C Name"] = uid
+                out_row[f"Unit{n}_OnOFF"] = row.get(f"{uid}_OnOFF", "")
+                out_row[f"Unit{n}_Mode"] = row.get(f"{uid}_Mode", "")
+                out_row[f"Unit{n}_SetTemp"] = row.get(f"{uid}_SetTemp", "")
+                out_row[f"Unit{n}_FanSpeed"] = row.get(f"{uid}_FanSpeed", "")
+            for i in range(len(legacy_uids), max_units):
+                n = i + 1
+                out_row[f"Unit{n}_A/C Name"] = ""
+                out_row[f"Unit{n}_OnOFF"] = ""
+                out_row[f"Unit{n}_Mode"] = ""
+                out_row[f"Unit{n}_SetTemp"] = ""
+                out_row[f"Unit{n}_FanSpeed"] = ""
+            rows.append(out_row)
+    if not rows:
+        return
+    out_df = pd.DataFrame(rows, columns=columns)
+    out_df = out_df.sort_values(["Zone", "Date Time"]).reset_index(drop=True)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    out_df.to_csv(output_path, index=False)
+    print(f"Wrote hourly units by zone: {output_path} ({len(out_df)} rows)", file=sys.stderr)
+
+
 def _unit_mode_from_schedule(
     unit_df: pd.DataFrame,
     unit_ids: list[str] | None = None,
@@ -413,6 +665,14 @@ def _unit_mode_from_schedule(
         if v in ("COOL", "HEAT", "FAN"):
             return v
         return None
+    def is_on(row, base: str) -> bool:
+        onoff_col = f"{base}_OnOFF"
+        if onoff_col not in row.index:
+            return True
+        v = row.get(onoff_col)
+        if pd.isna(v):
+            return False
+        return str(v).strip().upper() == "ON"
     unit_ids = [c.replace("_Mode", "") for c in mode_cols]
     labels = []
     cooling_units = []
@@ -421,7 +681,13 @@ def _unit_mode_from_schedule(
     modes_per_hour: list[list[str]] = []
     for _, row in unit_df.iterrows():
         labels.append(str(row[dt_col]))
-        modes = [norm(row[c]) for c in mode_cols]
+        modes = []
+        for c in mode_cols:
+            base = c.replace("_Mode", "")
+            if not is_on(row, base):
+                modes.append(None)
+            else:
+                modes.append(norm(row[c]))
         modes_per_hour.append([m if m else "OFF" for m in modes])
         cooling_units.append(sum(1 for m in modes if m == "COOL"))
         heating_units.append(sum(1 for m in modes if m == "HEAT"))
@@ -900,12 +1166,41 @@ def _viewer_html(embedded_data_json: str) -> str:
     if (m) return 'rgba(' + m[1] + ',' + m[2] + ',' + m[3] + ',0.55)';
     return c;
   }
+  function alignToLegacyLabels(legacyLabels, updatedLabels, updatedDataArrays, updatedColorArrays) {
+    if (!updatedLabels || !updatedLabels.length || !updatedDataArrays || !updatedDataArrays.length) return { data: [], colors: [] };
+    var n = legacyLabels.length;
+    var labelToIdx = {};
+    for (var j = 0; j < updatedLabels.length; j++) {
+      var k = updatedLabels[j];
+      if (k != null && k !== '') labelToIdx[String(k)] = j;
+    }
+    var outData = [];
+    var outColors = [];
+    for (var i = 0; i < updatedDataArrays.length; i++) {
+      var row = [];
+      var crow = [];
+      for (var h = 0; h < n; h++) {
+        var lbl = legacyLabels[h];
+        var j = (lbl != null && lbl !== '') ? labelToIdx[String(lbl)] : undefined;
+        if (j !== undefined) {
+          row.push(updatedDataArrays[i][j] != null ? updatedDataArrays[i][j] : 0);
+          crow.push(updatedColorArrays && updatedColorArrays[i] && updatedColorArrays[i][j] != null ? updatedColorArrays[i][j] : 'transparent');
+        } else {
+          row.push(0);
+          crow.push('transparent');
+        }
+      }
+      outData.push(row);
+      outColors.push(crow);
+    }
+    return { data: outData, colors: outColors };
+  }
   function buildCombinedUnitModeChartData(legacy, updated) {
-    if (!legacy || !legacy.labels || !legacy.labels.length) return null;
-    var labels = legacy.labels;
+    var labels = (legacy && legacy.labels && legacy.labels.length) ? legacy.labels : (updated && updated.labels && updated.labels.length) ? updated.labels : null;
+    if (!labels || !labels.length) return null;
     var n = labels.length;
     var datasets = [];
-    var maxLegacy = (legacy.unitModeData && legacy.unitModeData.length) ? legacy.unitModeData.length : 0;
+    var maxLegacy = (legacy && legacy.unitModeData && legacy.unitModeData.length) ? legacy.unitModeData.length : 0;
     var maxUpdated = (updated && updated.unitModeData && updated.unitModeData.length) ? updated.unitModeData.length : 0;
     var i, h;
     for (i = 0; i < maxLegacy; i++) {
@@ -923,11 +1218,15 @@ def _viewer_html(embedded_data_json: str) -> str:
       });
     }
     if (updated && updated.unitModeData && updated.unitModeColors) {
-      for (i = 0; i < maxUpdated; i++) {
-        var mutedColors = padOrTrim(updated.unitModeColors[i], n, 'transparent').map(muteColorForModel);
+      var aligned = alignToLegacyLabels(labels, updated.labels, updated.unitModeData, updated.unitModeColors);
+      var alignedData = aligned.data;
+      var alignedColors = aligned.colors;
+      for (i = 0; i < (alignedData.length || 0); i++) {
+        var mutedColors = (alignedColors[i] || []).map(muteColorForModel);
+        if (mutedColors.length < n) while (mutedColors.length < n) mutedColors.push('transparent');
         datasets.push({
           label: '\u30e2\u30c7\u30eb\u51fa\u529b ' + (i + 1) + '\u53f0',
-          data: padOrTrim(updated.unitModeData[i], n, 0),
+          data: padOrTrim(alignedData[i], n, 0),
           backgroundColor: mutedColors,
           borderColor: mutedColors,
           borderWidth: 0.5,
@@ -1035,7 +1334,7 @@ def _viewer_html(embedded_data_json: str) -> str:
     var updatedUm = data.unit_mode_updated;
     if (data.unit_mode_by_zone && selectedZone && data.unit_mode_by_zone[selectedZone]) {
       var z = data.unit_mode_by_zone[selectedZone];
-      legacyUm = z.legacy || legacyUm;
+      legacyUm = z.legacy;
       updatedUm = z.updated || updatedUm;
     }
     var hasUnitMode = (legacyUm && legacyUm.labels && legacyUm.labels.length) || (updatedUm && updatedUm.labels && updatedUm.labels.length);
@@ -1139,6 +1438,9 @@ def _viewer_html(embedded_data_json: str) -> str:
       }
     }
     html += '<div class="meta">\u6bd4\u8f03\u65e5: ' + escapeHtml(dateText || '\u2014') + '</div>';
+    html += '<div class="meta description" style="max-width:1100px;margin-top:8px;line-height:1.6;color:#444;">';
+    html += '\u672c\u30da\u30fc\u30b8\u3067\u306f\u3001\u904e\u53bb\u306eAC\u52e4\u52d9\u30c7\u30fc\u30bf\uff08\u5b9f\u7e3e\uff09\u3068\u6700\u9069\u5316\u30e2\u30c7\u30eb\u304c\u751f\u6210\u3057\u305f\u4e88\u6e2c\u30b9\u30b1\u30b8\u30e5\u30fc\u30eb\uff08\u30e2\u30c7\u30eb\u51fa\u529b\uff09\u3092\u6bd4\u8f03\u3057\u3066\u3044\u307e\u3059\u3002\u5404\u30be\u30fc\u30f3\u306e\u6e29\u5ea6\u3001\u96fb\u529b\u6d88\u8cbb\u91cf\u3001\u52e4\u52d9\u53f0\u6570\uff08\u53f0\u30e2\u30fc\u30c9\uff09\u306a\u3069\u3092\u6642\u7cfb\u5217\u3067\u78ba\u8a8d\u3057\u3001\u30e2\u30c7\u30eb\u306e\u9069\u6b63\u6027\u3092\u8a55\u4fa1\u3067\u304d\u307e\u3059\u3002<br><br><strong>\u30c7\u30fc\u30bf\u30bd\u30fc\u30b9\uff1a</strong> \u30be\u30fc\u30f3\u30b9\u30b1\u30b8\u30e5\u30fc\u30eb\uff08\u6e29\u5ea6\u30fb\u96fb\u529b\u30fb\u8a2d\u5b9a\u6e29\u5ea6\u306a\u3069\uff09\u306f\u3001\u5b9f\u7e3e\u3092 <code>features_clea.csv</code> \u304b\u3089\u3001\u30e2\u30c7\u30eb\u51fa\u529b\u3092 <code>zone_schedule_*_model.csv</code> \u304b\u3089\u53d6\u5f97\u3057\u3066\u3044\u307e\u3059\u3002\u30e6\u30cb\u30c3\u30c8\u5225AC\u52e4\u52d9\u72b6\u6cc1\uff08\u53f0\u30e2\u30fc\u30c9\uff09\u306f\u3001\u5b9f\u7e3e\u3092 <code>ac-control</code> \u30ed\u30b0\u30c7\u30fc\u30bf\u304b\u3089\u3001\u30e2\u30c7\u30eb\u51fa\u529b\u3092 <code>unit_schedule_*_model.csv</code> \u304b\u3089\u53d6\u5f97\u3057\u3066\u3044\u307e\u3059\u3002';
+    html += '</div>';
     html += '<h2 style="max-width:1100px;">サマリー</h2>';
     html += renderTable(['項目', '値'], (d.summary || []).map(function(r) { return { '項目': r.metric, '値': r.value }; }));
     if (hasTemp) {
@@ -1204,16 +1506,42 @@ def _write_html_report(
     unit_mode_updated = None
     unit_legacy_df: pd.DataFrame | None = None
     unit_updated_df: pd.DataFrame | None = None
-    unit_legacy_path = _resolve_unit_schedule_path(legacy_path)
-    unit_updated_path = _resolve_unit_schedule_path(updated_path)
-    if unit_legacy_path.exists():
+
+    # Legacy unit schedule: prefer building from ac-control logs (00_InputData/<store>/ac-control)
+    store = legacy_path.parent.name
+    date_range = _parse_date_range_from_legacy_path(legacy_path)
+    all_units_from_zones = (
+        sorted(set(u for uids in zone_to_units.values() for u in uids))
+        if zone_to_units else []
+    )
+    ac_control_dir = (
+        legacy_path.parent.parent.parent / "00_InputData" / store / "ac-control"
+        if len(legacy_path.parents) >= 3 else Path.cwd() / "data" / "00_InputData" / store / "ac-control"
+    )
+    if date_range and all_units_from_zones and ac_control_dir.is_dir():
         try:
-            unit_legacy_df = pd.read_csv(unit_legacy_path)
-            unit_mode_legacy = _unit_mode_from_schedule(unit_legacy_df)
-            if unit_mode_legacy:
-                _attach_temperature_to_unit_mode(unit_mode_legacy, chart_temperature, use_legacy=True)
+            unit_legacy_df = _load_unit_schedule_from_ac_logs(
+                store, date_range[0], date_range[1], all_units_from_zones, ac_control_dir
+            )
+            if unit_legacy_df is not None and not unit_legacy_df.empty:
+                unit_mode_legacy = _unit_mode_from_schedule(unit_legacy_df)
+                if unit_mode_legacy:
+                    _attach_temperature_to_unit_mode(unit_mode_legacy, chart_temperature, use_legacy=True)
         except Exception as e:
-            print(f"Warning: Could not load unit schedule (legacy) {unit_legacy_path}: {e}", file=sys.stderr)
+            print(f"Warning: Could not build legacy unit schedule from ac-control: {e}", file=sys.stderr)
+            unit_legacy_df = None
+    if unit_legacy_df is None:
+        unit_legacy_path = _resolve_unit_schedule_path(legacy_path)
+        if unit_legacy_path.exists():
+            try:
+                unit_legacy_df = pd.read_csv(unit_legacy_path)
+                unit_mode_legacy = _unit_mode_from_schedule(unit_legacy_df)
+                if unit_mode_legacy:
+                    _attach_temperature_to_unit_mode(unit_mode_legacy, chart_temperature, use_legacy=True)
+            except Exception as e:
+                print(f"Warning: Could not load unit schedule (legacy) {unit_legacy_path}: {e}", file=sys.stderr)
+
+    unit_updated_path = _resolve_unit_schedule_path(updated_path)
     if unit_updated_path.exists():
         try:
             unit_updated_df = pd.read_csv(unit_updated_path)
@@ -1228,10 +1556,23 @@ def _write_html_report(
         unit_mode_by_zone = {}
         for zone in zones:
             uids = zone_to_units.get(zone) or []
-            leg_z = _unit_mode_from_schedule(unit_legacy_df, uids) if unit_legacy_df is not None and uids else None
+            legacy_uids = [uid for uid in uids if unit_legacy_df is not None and f"{uid}_Mode" in unit_legacy_df.columns]
+            leg_z = _unit_mode_from_schedule(unit_legacy_df, legacy_uids) if unit_legacy_df is not None and legacy_uids else None
             upd_z = _unit_mode_from_schedule(unit_updated_df, uids) if unit_updated_df is not None and uids else None
-            if leg_z is not None or upd_z is not None:
-                unit_mode_by_zone[zone] = {"legacy": leg_z, "updated": upd_z}
+            unit_mode_by_zone[zone] = {"legacy": leg_z, "updated": upd_z}
+
+    # Before comparison: write AC logs zone-by-zone for the date range (same data used for legacy unit mode)
+    if unit_legacy_df is not None and zone_to_units and date_range:
+        ac_logs_by_zone_path = output_dir / f"ac_logs_by_zone_{date_range[0]}_{date_range[1]}.csv"
+        try:
+            _write_ac_logs_by_zone(unit_legacy_df, zone_to_units, ac_logs_by_zone_path)
+        except Exception as e:
+            print(f"Warning: Could not write ac_logs_by_zone file: {e}", file=sys.stderr)
+        hourly_units_path = output_dir / f"hourly_units_by_zone_{date_range[0]}_{date_range[1]}.csv"
+        try:
+            _write_hourly_units_by_zone(unit_legacy_df, zone_to_units, hourly_units_path)
+        except Exception as e:
+            print(f"Warning: Could not write hourly_units_by_zone file: {e}", file=sys.stderr)
 
     payload = _build_report_payload(
         merged,
